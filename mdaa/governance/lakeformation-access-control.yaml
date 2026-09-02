@@ -1,0 +1,73 @@
+# =============================================================================
+# Lake Formation Access Control — Grants for HealthLake FHIR Data
+# =============================================================================
+# HealthLake automatically creates a resource link database in Lake Formation
+# with Iceberg tables for each FHIR resource type. This config grants access
+# to those tables for our two access roles.
+#
+# Database name follows the pattern: healthlake-<datastore-id>
+# Tables created by HealthLake include: patient, encounter, condition,
+# observation, medicationrequest, immunization, allergyintolerance, etc.
+#
+# PHI / HIPAA NOTICE:
+# This configuration grants access to HealthLake FHIR data, which is protected
+# health information (PHI) under HIPAA. If you process real PHI, this is a
+# HIPAA-regulated workload: execute an AWS Business Associate Addendum (BAA),
+# keep data within HIPAA-eligible services, and enable encryption, access
+# logging, and audit controls. The customer is responsible for compliant
+# handling of regulated data. This sample ships with synthetic data only.
+# =============================================================================
+
+principals:
+  # Clinical analyst — can query clinical data but not patient PII
+  clinicalAnalyst:
+    role:
+      id: generated-role-id:clinical-analyst
+
+  # Patient admin — full access to all FHIR resources including PII
+  patientAdmin:
+    role:
+      id: generated-role-id:patient-admin
+
+grants:
+  # Patient admin gets full read access to ALL tables in the HealthLake database
+  patient_admin_full_access:
+    database: "{{context:healthlake-db-name}}"
+    databasePermissions: read
+    tablePermissions: read
+    tables:
+      - '*'
+    principals:
+      - patientAdmin
+
+  # Clinical analyst gets read access to non-PII clinical tables
+  clinical_analyst_clinical_data:
+    database: "{{context:healthlake-db-name}}"
+    databasePermissions: read
+    tablePermissions: read
+    tables:
+      - encounter
+      - condition
+      - observation
+      - medicationrequest
+      - immunization
+      - allergyintolerance
+      - diagnosticreport
+      - procedure
+      - documentreference
+    principals:
+      - clinicalAnalyst
+
+  # Clinical analyst gets database-level DESCRIBE only (needed for Athena catalog browsing)
+  # Patient table is NOT included — they cannot query patient demographics/PII
+  # If column-level filtering is needed on patient table, use LF console manually
+  # (MDAA access-control module grants at table level, not column level)
+
+# Resource link to the HealthLake shared database
+# HealthLake creates this automatically — we just need to grant access to it
+resourceLinks:
+  healthlake_resource_link:
+    targetDatabase: "{{context:healthlake-db-name}}"
+    grantPrincipals:
+      - clinicalAnalyst
+      - patientAdmin

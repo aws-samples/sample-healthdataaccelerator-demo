@@ -1,0 +1,12 @@
+[submodule "submodules/openemr-on-ecs"]
+	path = submodules/openemr-on-ecs
+	url = https://github.com/openemr/openemr-on-ecs
+	branch = main
+[submodule "submodules/modern-data-architecture-accelerator"]
+	path = submodules/modern-data-architecture-accelerator
+	url = https://github.com/aws/modern-data-architecture-accelerator
+	branch = main
+[submodule "submodules/synthea"]
+	path = submodules/synthea
+	url = https://github.com/synthetichealth/synthea
+	branch = master

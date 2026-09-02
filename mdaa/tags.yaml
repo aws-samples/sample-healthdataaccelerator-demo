@@ -1,0 +1,5 @@
+# Tags applied to all MDAA-deployed resources
+Project: hdademo
+Environment: dev
+Owner: healthcare-demo
+Purpose: Lake Formation governance for HealthLake FHIR data

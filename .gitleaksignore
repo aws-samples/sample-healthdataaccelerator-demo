@@ -1,0 +1,6 @@
+# These findings are from historical commits where values have since been removed.
+# The secrets were deployment-specific identifiers (Cognito pool IDs, API Gateway URLs,
+# Secrets Manager ARNs) that are no longer present in the current codebase.
+8c3eea0b786d3cd07dfbf47eacfb3b733cee13c8:app_healthlake_sync.py:generic-api-key:38
+8c3eea0b786d3cd07dfbf47eacfb3b733cee13c8:patient-dashboard/public/config.js:generic-api-key:7
+c417953a7a1d489428ce0a45c394c11f73570c8b:ProbeScanExport-ed5a1967-8683-4605-a28b-b713cb819301-main-20260710.csv:generic-api-key:50

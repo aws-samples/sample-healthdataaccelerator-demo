@@ -1,0 +1,21 @@
+# =============================================================================
+# Athena Workgroup — Governed FHIR Data Queries
+# =============================================================================
+# Creates an Athena workgroup for querying HealthLake data with Lake Formation
+# permissions enforced. Requires Athena engine v3 for HealthLake integration.
+#
+# Usage:
+#   1. Open Athena console
+#   2. Select the "healthlake_analytics" workgroup
+#   3. Select the HealthLake resource link database
+#   4. Run SQL queries — LF permissions automatically filter results
+# =============================================================================
+
+# Admin roles — full access to workgroup resources (results bucket, config)
+dataAdminRoles:
+  - id: generated-role-id:patient-admin
+
+# User roles — can execute queries in this workgroup
+athenaUserRoles:
+  - id: generated-role-id:clinical-analyst
+  - id: generated-role-id:patient-admin

@@ -1,0 +1,61 @@
+# =============================================================================
+# MDAA Configuration for hdademo - Lake Formation Governance
+# =============================================================================
+# Minimal MDAA config using only the governance modules needed to apply
+# Lake Formation access control over HealthLake's auto-generated Athena tables.
+#
+# HealthLake automatically creates a resource link database in Lake Formation
+# (named healthlake-<datastore-id>) with Iceberg tables for each FHIR resource
+# type. This config grants access to those tables via MDAA's security-hardened
+# modules.
+#
+# Prerequisites:
+#   - HealthLake datastore deployed (via CDK HealthLakeDatastoreStack)
+#   - MDAA CLI installed: npm install -g @aws-mdaa/cli
+#
+# Deploy:
+#   cd mdaa && mdaa deploy
+# =============================================================================
+
+region: default
+
+tag_configs:
+  - ./tags.yaml
+
+# Set your organization name (used in resource naming)
+organization: hdademo
+
+# Context values populated by deploy.sh from CDK stack outputs
+context:
+  healthlake-datastore-id: 5dfab16a2fe158b51b34ebb5a4a4317b
+  healthlake-db-name: healthcare_demo_datastore_5dfab16a2fe158b51b34ebb5a4a4317b_healthlake_view
+
+domains:
+  governance:
+    environments:
+      dev:
+        account: default
+        modules:
+          # Create IAM roles for data access tiers
+          roles:
+            module_path: "@aws-mdaa/roles"
+            module_configs:
+              - ./roles.yaml
+
+          # Configure Lake Formation settings (admin registration)
+          lakeformation-settings:
+            module_path: "@aws-mdaa/lakeformation-settings"
+            module_configs:
+              - ./governance/lakeformation-settings.yaml
+
+          # Grant fine-grained access to HealthLake resource link tables
+          lakeformation-access:
+            module_path: "@aws-mdaa/lakeformation-access-control"
+            module_configs:
+              - ./governance/lakeformation-access-control.yaml
+
+          # Athena workgroup for governed FHIR queries (engine v3)
+          athena:
+            module_path: "@aws-mdaa/athena-workgroup"
+            module_configs:
+              - ./governance/athena.yaml
