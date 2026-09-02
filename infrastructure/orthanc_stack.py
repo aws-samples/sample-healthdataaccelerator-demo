@@ -542,10 +542,17 @@ class OrthancStack(Stack):
                     "kms:Decrypt",
                     "kms:Encrypt",
                 ],
-                # Scope to the specific HealthLake CMK when known. The wildcard
-                # fallback only applies when reusing an existing datastore whose
-                # key ARN isn't available here, and it stays constrained to
-                # HealthLake usage via the kms:ViaService condition below.
+                # Scope to the specific HealthLake CMK when its ARN is known
+                # (the default create-new-datastore path always passes it, so the
+                # resource is a single key ARN). The wildcard is ONLY a fallback
+                # for the bring-your-own-datastore path where the key ARN is not
+                # available at synth time, and it remains constrained to
+                # HealthLake-initiated calls via the kms:ViaService condition
+                # below.
+                # SECURITY (least privilege): this key/* wildcard fallback MUST be
+                # replaced with the specific HealthLake CMK ARN before production
+                # use. Pass healthlake_kms_key_arn (e.g. from the datastore's
+                # KmsKeyId) so this policy scopes to that single key ARN.
                 resources=[
                     self.healthlake_kms_key_arn if self.healthlake_kms_key_arn
                     else f"arn:aws:kms:us-east-1:{self.account}:key/*",
