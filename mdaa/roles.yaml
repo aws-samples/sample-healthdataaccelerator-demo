@@ -1,0 +1,49 @@
+# =============================================================================
+# IAM Roles for Lake Formation Data Access
+# =============================================================================
+# Two access tiers:
+#   - clinical-analyst: Can query clinical data (encounters, conditions, etc.)
+#                       but CANNOT see patient PII (SSN, address, phone)
+#   - patient-admin:    Full access to all FHIR data including patient PII
+# =============================================================================
+
+generatePolicies:
+  # Coarse-grained Glue catalog access (effective permissions controlled by LF grants)
+  DataUserPolicy:
+    policyDocument:
+      Statement:
+        - SID: GlueCoarseGrainedAccess
+          Effect: Allow
+          Resource:
+            - arn:{{partition}}:glue:{{region}}:{{account}}:catalog
+            - arn:{{partition}}:glue:{{region}}:{{account}}:database/*
+            - arn:{{partition}}:glue:{{region}}:{{account}}:table/*
+          Action:
+            - glue:GetDatabase
+            - glue:GetDatabases
+            - glue:GetTable
+            - glue:GetTables
+            - glue:GetPartition
+            - glue:GetPartitions
+            - glue:SearchTables
+        - SID: BasicAthenaAccess
+          Effect: Allow
+          Action:
+            - athena:ListWorkGroups
+          Resource: "*"
+    suppressions:
+      - id: "AwsSolutions-IAM5"
+        reason: "Glue resource names not known at deployment time; LF grants control effective access."
+
+generateRoles:
+  # Clinical analyst — limited access (no PII)
+  clinical-analyst:
+    trustedPrincipal: this_account
+    generatedPolicies:
+      - DataUserPolicy
+
+  # Patient admin — full access
+  patient-admin:
+    trustedPrincipal: this_account
+    generatedPolicies:
+      - DataUserPolicy

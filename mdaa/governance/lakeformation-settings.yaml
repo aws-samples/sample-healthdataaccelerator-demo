@@ -1,0 +1,14 @@
+# =============================================================================
+# Lake Formation Settings
+# =============================================================================
+# Register the MDAA-generated admin role as a Lake Formation administrator.
+# Set iamAllowedPrincipalsDefault to false so that ALL access must be
+# explicitly granted via Lake Formation (fine-grained access control).
+# =============================================================================
+
+# Admin roles that can manage Lake Formation permissions
+lakeFormationAdminRoles:
+  - id: generated-role-id:patient-admin
+
+# Disable IAM_ALLOWED_PRINCIPALS default — enforce explicit LF grants
+iamAllowedPrincipalsDefault: false

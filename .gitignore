@@ -1,0 +1,166 @@
+# macOS
+.DS_Store
+
+# ProbeScan exports
+ProbeScanExport-*.csv
+
+# Credentials
+aws_creds.sh
+*_creds.sh
+*-creds.sh
+
+# CDK output
+cdk.out/
+cdk.out.new/
+cdk.out.new2/
+cdk.out.deploy/
+cdk.context.json
+
+# IDE
+.vscode/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# Lambda vendored dependencies
+lambda/*/boto3/
+lambda/*/boto3-*.dist-info/
+lambda/*/botocore/
+lambda/*/botocore-*.dist-info/
+lambda/*/requests/
+lambda/*/requests-*.dist-info/
+lambda/*/urllib3/
+lambda/*/urllib3-*.dist-info/
+lambda/*/certifi/
+lambda/*/certifi-*.dist-info/
+lambda/*/charset_normalizer/
+lambda/*/charset_normalizer-*.dist-info/
+lambda/*/idna/
+lambda/*/idna-*.dist-info/
+lambda/*/requests_aws4auth/
+lambda/*/requests_aws4auth-*.dist-info/
+lambda/*/dateutil/
+lambda/*/python_dateutil-*.dist-info/
+lambda/*/jmespath/
+lambda/*/jmespath-*.dist-info/
+lambda/*/s3transfer/
+lambda/*/s3transfer-*.dist-info/
+lambda/*/six.py
+lambda/*/six-*.dist-info/
+lambda/*/pymysql/
+lambda/*/pymysql-*.dist-info/
+lambda/*/bin/
+
+# Node
+node_modules/
+
+# Task definitions with account-specific info
+*task-def*.json
+current-task-def.json
+
+# Database dumps
+*.dump
+
+# Test files with credentials
+test_pagination.py
+
+# Session manager
+*.pkg
+dicom_manifest.json
+
+# Submodule build artifacts
+submodules/**/__pycache__/
+submodules/**/*.pyc
+submodules/**/node_modules/
+submodules/**/cdk.out/
+submodules/**/.venv/
+
+# Kiro workspace
+.kiro/
+
+# CDK deploy output
+cdk.out.deploy/
+
+# Vendored Lambda dependencies (installed for direct zip deploy debugging)
+lambda/data_loader/mysql/
+lambda/data_loader/mysql_connector_python*.dist-info/
+lambda/data_loader/numpy/
+lambda/data_loader/numpy*/
+lambda/data_loader/pydicom/
+lambda/data_loader/pydicom*/
+lambda/data_loader/*.so
+lambda/openemr_db_sync/boto3/
+lambda/openemr_db_sync/botocore/
+lambda/openemr_db_sync/requests/
+lambda/openemr_db_sync/pymysql/
+lambda/openemr_db_sync/urllib3/
+lambda/openemr_db_sync/certifi/
+lambda/openemr_db_sync/dateutil/
+lambda/openemr_db_sync/jmespath/
+lambda/openemr_db_sync/six.py
+lambda/openemr_db_sync/charset_normalizer/
+lambda/openemr_db_sync/idna/
+lambda/openemr_db_sync/s3transfer/
+lambda/openemr_db_sync/*.dist-info/
+lambda/openemr_db_sync/*.so
+
+# MDAA working directory
+mdaa/.mdaa_working/
+
+# Patient Dashboard build output and deps
+patient-dashboard/dist/
+patient-dashboard/node_modules/
+
+# FHIR sync Lambda vendored dependencies
+lambda/openemr_healthlake_sync/pymysql/
+lambda/openemr_healthlake_sync/pymysql-*.dist-info/
+lambda/openemr_healthlake_sync/requests/
+lambda/openemr_healthlake_sync/requests-*.dist-info/
+lambda/openemr_healthlake_sync/urllib3/
+lambda/openemr_healthlake_sync/urllib3-*.dist-info/
+lambda/openemr_healthlake_sync/certifi/
+lambda/openemr_healthlake_sync/certifi-*.dist-info/
+lambda/openemr_healthlake_sync/charset_normalizer/
+lambda/openemr_healthlake_sync/charset_normalizer-*.dist-info/
+lambda/openemr_healthlake_sync/idna/
+lambda/openemr_healthlake_sync/idna-*.dist-info/
+lambda/openemr_healthlake_sync/bin/
+lambda/openemr_healthlake_sync/*.so
+
+# Stray files from OpenEMR config screenshots
+Connectors
+Enable
+Globals
+
+# Synthea submodule (checked out by deploy.sh)
+
+
+# Security scan reports
+scan-report*.json
+
+# Local utility / operational scripts (env-specific, kept out of the repo).
+# Deploy-critical scripts are re-included below.
+scripts/api_endpoint_test.py
+scripts/test_data_api.py
+scripts/check-status.sh
+scripts/scale-up.sh
+scripts/scale-down.sh
+scripts/port_forward_to_rds.sh
+scripts/generate_orthanc_dicom.py
+scripts/fix_orthanc_patient_names.py
+scripts/reassign_sample_patients.py
+scripts/cleanup_duplicate_patients.py
+scripts/synthea/load_synthea_to_openemr.py
+# Re-include deploy-critical scripts that the documented workflow depends on
+!scripts/setup.sh
+!scripts/deploy.sh
+!scripts/destroy.sh
+!scripts/synthea/synthea.properties
+!scripts/synthea/run_synthea.sh
