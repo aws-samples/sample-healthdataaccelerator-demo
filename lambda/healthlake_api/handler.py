@@ -6,6 +6,7 @@ Includes Bedrock integration for AI summaries and chat.
 
 import json
 import os
+import time
 import boto3
 from urllib.parse import urlencode, quote
 
@@ -18,9 +19,43 @@ ORTHANC_CREDENTIALS_SECRET_ARN = os.environ.get('ORTHANC_CREDENTIALS_SECRET_ARN'
 BEDROCK_GUARDRAIL_ID = os.environ.get('BEDROCK_GUARDRAIL_ID')
 BEDROCK_GUARDRAIL_VERSION = os.environ.get('BEDROCK_GUARDRAIL_VERSION')
 
+# Live guardrail on/off toggle. The handler reads this SSM parameter on each
+# request (short TTL cache) to decide whether to attach the guardrail to the
+# model invocation. Changing the parameter value toggles the guardrail live
+# with no redeploy. Empty when guardrails are disabled at deploy.
+GUARDRAIL_TOGGLE_PARAM = os.environ.get('GUARDRAIL_TOGGLE_PARAM')
+
 # Initialize clients
 healthlake_client = boto3.client('healthlake', region_name='us-east-1')
 bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
+ssm_client = boto3.client('ssm', region_name='us-east-1')
+
+# Small in-process cache for the toggle value so we don't call SSM on every
+# single invocation but still pick up changes within a few seconds.
+_toggle_cache = {"value": None, "ts": 0.0}
+_TOGGLE_TTL_SECONDS = 5
+
+
+def _guardrail_enabled():
+    """Return True if the guardrail should be applied, per the live SSM toggle.
+
+    Defaults to True (guardrail ON) when the toggle isn't configured or SSM
+    can't be read - fail safe toward the guardrail being active.
+    """
+    if not (BEDROCK_GUARDRAIL_ID and BEDROCK_GUARDRAIL_VERSION):
+        return False  # no guardrail deployed
+    if not GUARDRAIL_TOGGLE_PARAM:
+        return True  # guardrail deployed but no toggle -> always on
+    now = time.time()
+    if _toggle_cache["value"] is None or (now - _toggle_cache["ts"]) > _TOGGLE_TTL_SECONDS:
+        try:
+            resp = ssm_client.get_parameter(Name=GUARDRAIL_TOGGLE_PARAM)
+            _toggle_cache["value"] = resp['Parameter']['Value'].strip().lower()
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARN: could not read guardrail toggle, defaulting ON: {type(exc).__name__}")
+            _toggle_cache["value"] = "on"
+        _toggle_cache["ts"] = now
+    return _toggle_cache["value"] == "on"
 
 
 def _get_orthanc_password():
@@ -382,13 +417,24 @@ def format_patient_context(patient_data):
     return '\n'.join(ctx)
 
 
-def call_bedrock(system_prompt, user_message, max_tokens=400):
-    """Call Bedrock Nova for AI responses.
+_GUARDRAIL_FALLBACK = (
+    "I can only report documented facts from the patient's record and "
+    "cannot provide medical advice, diagnoses, or treatment guidance. "
+    "Please consult a qualified clinician."
+)
 
-    When a Bedrock Guardrail is configured (BEDROCK_GUARDRAIL_ID /
-    BEDROCK_GUARDRAIL_VERSION), it is applied to the invocation as a
-    responsible-AI control. If the guardrail blocks the request or response,
-    a safe fallback message is returned instead of model output.
+
+def call_bedrock(system_prompt, user_message, max_tokens=400):
+    """Call Bedrock Nova for AI responses (summary/chat features).
+
+    The Responsible-AI guardrail is applied to the invocation ONLY when the
+    live SSM toggle (GUARDRAIL_TOGGLE_PARAM) is 'on'. This lets a demo flip the
+    guardrail on/off instantly (one SSM edit) with no redeploy:
+      - guardrail ON  -> medical-advice / prompt-injection / harmful content
+        are blocked and a safe fallback message is returned.
+      - guardrail OFF -> the raw model output is returned (unguarded), to
+        contrast the behavior.
+    When no guardrail was deployed, the call is always unguarded.
     """
     invoke_kwargs = {
         'modelId': 'amazon.nova-lite-v1:0',
@@ -401,10 +447,12 @@ def call_bedrock(system_prompt, user_message, max_tokens=400):
         })
     }
 
-    # Apply the guardrail when configured (defense-in-depth over the prompts).
-    if BEDROCK_GUARDRAIL_ID and BEDROCK_GUARDRAIL_VERSION:
+    # Apply the guardrail only when the live toggle says ON.
+    guardrail_on = _guardrail_enabled()
+    if guardrail_on:
         invoke_kwargs['guardrailIdentifier'] = BEDROCK_GUARDRAIL_ID
         invoke_kwargs['guardrailVersion'] = BEDROCK_GUARDRAIL_VERSION
+    print(f"Bedrock invoke: guardrail {'ON' if guardrail_on else 'OFF'}")
 
     response = bedrock_client.invoke_model(**invoke_kwargs)
     result = json.loads(response['body'].read())
@@ -413,20 +461,25 @@ def call_bedrock(system_prompt, user_message, max_tokens=400):
     # than any (possibly blocked/empty) model content.
     if result.get('amazon-bedrock-guardrailAction') == 'INTERVENED':
         print("Bedrock guardrail INTERVENED on this request")
-        return (
-            "I can only report documented facts from the patient's record and "
-            "cannot provide medical advice, diagnoses, or treatment guidance. "
-            "Please consult a qualified clinician."
-        )
+        return _GUARDRAIL_FALLBACK
 
     return result['output']['message']['content'][0]['text']
 
 
 def generate_patient_summary(patient_data):
-    """Generate an AI summary of the patient's health profile - facts only."""
+    """Generate an AI summary of the patient's health profile.
+
+    The system prompt follows the live guardrail toggle so the on/off demo is
+    visible in the response itself:
+      - guardrail ON  -> STRICT "facts only" prompt (no interpretation), and
+        the Bedrock guardrail is also applied (defense in depth).
+      - guardrail OFF -> a permissive clinical-assistant prompt that WILL offer
+        interpretation/recommendations, so the unguarded behavior is obvious.
+    """
     context = format_patient_context(patient_data)
-    
-    system_prompt = """You are a clinical data summarizer. Your ONLY job is to summarize the patient data provided.
+
+    if _guardrail_enabled():
+        system_prompt = """You are a clinical data summarizer. Your ONLY job is to summarize the patient data provided.
 
 STRICT RULES:
 1. ONLY state facts explicitly present in the provided data
@@ -438,15 +491,32 @@ STRICT RULES:
 7. Do NOT use "may indicate", "could suggest", "likely", or "possibly"
 
 Provide a brief factual summary (3-4 sentences) listing only what is documented."""
+    else:
+        system_prompt = """You are a clinical assistant AI. Summarize the patient's health profile and provide
+helpful clinical interpretation.
 
-    return call_bedrock(system_prompt, f"Summarize ONLY the facts in this patient record:\n\n{context}")
+- Summarize the key findings in the record.
+- Offer clinical interpretation: note possible connections between conditions,
+  what the findings may indicate, and considerations a clinician might weigh.
+- Where relevant, suggest potential diagnoses or treatment directions to consider.
+
+Provide a helpful summary (3-5 sentences)."""
+
+    return call_bedrock(system_prompt, f"Summarize this patient record:\n\n{context}")
 
 
 def patient_chat(patient_data, question, chat_history=None):
-    """Answer questions about the patient's data - facts only."""
+    """Answer questions about the patient's data.
+
+    The system prompt follows the live guardrail toggle (see
+    generate_patient_summary): STRICT facts-only when the guardrail is ON,
+    permissive clinical-assistant when OFF - so toggling the guardrail visibly
+    changes whether the assistant will offer diagnoses / recommendations.
+    """
     context = format_patient_context(patient_data)
-    
-    system_prompt = f"""You answer questions using ONLY the patient data below. Nothing else.
+
+    if _guardrail_enabled():
+        system_prompt = f"""You answer questions using ONLY the patient data below. Nothing else.
 
 PATIENT DATA:
 {context}
@@ -462,6 +532,16 @@ STRICT RULES:
 8. For medical advice questions, say: "I can only report what is in the record."
 
 Be concise. Only report documented facts."""
+    else:
+        system_prompt = f"""You are a clinical assistant AI helping a clinician review a patient.
+
+PATIENT DATA:
+{context}
+
+Answer the clinician's question helpfully. You may interpret the data, note
+possible connections between conditions, suggest potential diagnoses to
+consider, and recommend treatment directions or next steps. Be clear and
+clinically useful."""
 
     if chat_history:
         history_text = "\n".join([f"Q: {h['question']}\nA: {h['answer']}" for h in chat_history[-3:]])

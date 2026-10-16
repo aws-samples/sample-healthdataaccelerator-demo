@@ -43,6 +43,7 @@ from aws_cdk import (
     aws_globalaccelerator_endpoints as ga_endpoints,
     aws_route53 as route53,
     aws_route53_targets as targets,
+    aws_servicediscovery as servicediscovery,
     CfnOutput,
     triggers,
     Duration,
@@ -57,9 +58,23 @@ import string
 class OpenemrEcsStack(Stack):
     """Provision the full OpenEMR reference architecture using CDK and AWS Fargate."""
 
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
-        """Initialise stack defaults and trigger creation of all managed resources."""
+    def __init__(self, scope: Construct, construct_id: str,
+                 self_signed_certificate_arn: str = None, **kwargs) -> None:
+        """Initialise stack defaults and trigger creation of all managed resources.
+
+        self_signed_certificate_arn: optional ACM ARN of an imported self-signed
+        certificate. When provided (and no route53_domain / certificate_arn
+        context is set), the public ALB serves HTTPS using this certificate.
+        """
         super().__init__(scope, construct_id, **kwargs)
+
+        # Preserve the construct id for use in helper methods (e.g. deriving the
+        # Cloud Map private DNS namespace name in _create_openemr_service).
+        self._construct_id = construct_id
+
+        # Optional self-signed ACM cert ARN (deploy-time token) used to enable
+        # HTTPS on the public ALB when no domain / validated cert is available.
+        self.self_signed_certificate_arn = self_signed_certificate_arn
 
         ##########################################################
         # These variables describe constants that can be changed.
@@ -396,50 +411,27 @@ class OpenemrEcsStack(Stack):
             vpc=self.vpc,
             allow_all_outbound=False
         )
-        if self.node.try_get_context("certificate_arn") or self.node.try_get_context("route53_domain"):
-            cidr_ipv4 = self.node.try_get_context("security_group_ip_range_ipv4")
-            if cidr_ipv4:
-                self.lb_sec_group.add_ingress_rule(
-                    ec2.Peer.ipv4(cidr_ipv4),
-                    ec2.Port.tcp(443),
-                )
-                self.lb_sec_group.add_egress_rule(
-                    ec2.Peer.ipv4(cidr_ipv4),
-                    ec2.Port.tcp(443),
-                )
-        else:
-            cidr_ipv4 = self.node.try_get_context("security_group_ip_range_ipv4")
-            if cidr_ipv4:
-                self.lb_sec_group.add_ingress_rule(
-                    ec2.Peer.ipv4(cidr_ipv4),
-                    ec2.Port.tcp(80),
-                )
-                self.lb_sec_group.add_egress_rule(
-                    ec2.Peer.ipv4(cidr_ipv4),
-                    ec2.Port.tcp(80),
-                )
-        if self.node.try_get_context("certificate_arn") or self.node.try_get_context("route53_domain"):
-            cidr_ipv6 = self.node.try_get_context("security_group_ip_range_ipv6")
-            if cidr_ipv6:
-                self.lb_sec_group.add_ingress_rule(
-                    ec2.Peer.ipv6(cidr_ipv6),
-                    ec2.Port.tcp(443),
-                )
-                self.lb_sec_group.add_egress_rule(
-                    ec2.Peer.ipv6(cidr_ipv6),
-                    ec2.Port.tcp(443),
-                )
-        else:
-            cidr_ipv6 = self.node.try_get_context("security_group_ip_range_ipv6")
-            if cidr_ipv6:
-                self.lb_sec_group.add_ingress_rule(
-                    ec2.Peer.ipv6(cidr_ipv6),
-                    ec2.Port.tcp(80),
-                )
-                self.lb_sec_group.add_egress_rule(
-                    ec2.Peer.ipv6(cidr_ipv6),
-                    ec2.Port.tcp(80),
-                )
+        # The ALB is always HTTPS - only allow 443 (no port-80 rules).
+        cidr_ipv4 = self.node.try_get_context("security_group_ip_range_ipv4")
+        if cidr_ipv4:
+            self.lb_sec_group.add_ingress_rule(
+                ec2.Peer.ipv4(cidr_ipv4),
+                ec2.Port.tcp(443),
+            )
+            self.lb_sec_group.add_egress_rule(
+                ec2.Peer.ipv4(cidr_ipv4),
+                ec2.Port.tcp(443),
+            )
+        cidr_ipv6 = self.node.try_get_context("security_group_ip_range_ipv6")
+        if cidr_ipv6:
+            self.lb_sec_group.add_ingress_rule(
+                ec2.Peer.ipv6(cidr_ipv6),
+                ec2.Port.tcp(443),
+            )
+            self.lb_sec_group.add_egress_rule(
+                ec2.Peer.ipv6(cidr_ipv6),
+                ec2.Port.tcp(443),
+            )
 
     def _create_alb(self):
         """Deploy the public Application Load Balancer and optional Global Accelerator."""
@@ -459,17 +451,9 @@ class OpenemrEcsStack(Stack):
             # Create global accelerator
             self.accelerator = ga.Accelerator(self, "GlobalAccelerator")
 
-            # Add ALB endpoint to global accelerator
-            if self.node.try_get_context("certificate_arn") or self.node.try_get_context("route53_domain"):
-
-                # Use HTTPS if certificate is provided
-                ga_listener = self.accelerator.add_listener("GAListener",
-                                                            port_ranges=[ga.PortRange(from_port=443, to_port=443)])
-
-            else:
-                # Use HTTP if no certificate is provided
-                ga_listener = self.accelerator.add_listener("GAListener",
-                                                            port_ranges=[ga.PortRange(from_port=80, to_port=80)])
+            # Add ALB endpoint to global accelerator (HTTPS:443 only)
+            ga_listener = self.accelerator.add_listener("GAListener",
+                                                        port_ranges=[ga.PortRange(from_port=443, to_port=443)])
 
             ga_listener.add_endpoint_group(
                 "EndpointGroup",
@@ -477,18 +461,11 @@ class OpenemrEcsStack(Stack):
             )
 
             # Output the Global Accelerator URL
-            if self.node.try_get_context("certificate_arn") or self.node.try_get_context("route53_domain"):
-                CfnOutput(
-                    self, "GlobalAcceleratorUrl",
-                    value=f"https://{self.accelerator.dns_name}",
-                    description="The URL for the Global Accelerator"
-                )
-            else:
-                CfnOutput(
-                    self, "GlobalAcceleratorUrl",
-                    value=f"http://{self.accelerator.dns_name}",
-                    description="The URL for the Global Accelerator"
-                )
+            CfnOutput(
+                self, "GlobalAcceleratorUrl",
+                value=f"https://{self.accelerator.dns_name}",
+                description="The URL for the Global Accelerator"
+            )
 
         if self.node.try_get_context("activate_openemr_apis") == "true":
             self.activate_fhir_service = ssm.StringParameter(
@@ -524,22 +501,15 @@ class OpenemrEcsStack(Stack):
                         string_value='http://openemr.' + self.node.try_get_context("route53_domain") + '/portal/'
                     )
             else:
-                # Value of DNS name will change based on whether it's using a global accelerator endpoint
+                # Value of DNS name will change based on whether it's using a global accelerator endpoint.
+                # The ALB/accelerator are always HTTPS.
                 if self.node.try_get_context("enable_global_accelerator") == "true":
-                    if self.node.try_get_context("certificate_arn") or self.node.try_get_context("route53_domain"):
-                        self.portal_onsite_two_address = ssm.StringParameter(
-                            scope=self,
-                            id="portal-onsite-two-address",
-                            parameter_name="portal_onsite_two_address",
-                            string_value='https://' + self.accelerator.dns_name + '/portal/',
-                        )
-                    else:
-                        self.portal_onsite_two_address = ssm.StringParameter(
-                            scope=self,
-                            id="portal-onsite-two-address",
-                            parameter_name="portal_onsite_two_address",
-                            string_value='http://' + self.accelerator.dns_name + '/portal/'
-                        )
+                    self.portal_onsite_two_address = ssm.StringParameter(
+                        scope=self,
+                        id="portal-onsite-two-address",
+                        parameter_name="portal_onsite_two_address",
+                        string_value='https://' + self.accelerator.dns_name + '/portal/',
+                    )
                 else:
                     self.portal_onsite_two_address = ssm.StringParameter(
                         scope=self,
@@ -587,40 +557,47 @@ class OpenemrEcsStack(Stack):
                         string_value='http://openemr.' + self.node.try_get_context("route53_domain")
                     )
             else:
-                # Value of DNS name will change based on whether it's using a global accelerator endpoint
+                # Value of DNS name will change based on whether it's using a global accelerator endpoint.
+                # The ALB/accelerator are always HTTPS.
                 if self.node.try_get_context("enable_global_accelerator") == "true":
-                    if self.node.try_get_context("certificate_arn") or self.node.try_get_context("route53_domain"):
-                        self.site_addr_oath = ssm.StringParameter(
-                            scope=self,
-                            id="site-addr-oath",
-                            parameter_name="site_addr_oath",
-                            string_value='https://' + self.accelerator.dns_name
-                        )
-                    else:
-                        self.site_addr_oath = ssm.StringParameter(
-                            scope=self,
-                            id="site-addr-oath",
-                            parameter_name="site_addr_oath",
-                            string_value='http://' + self.accelerator.dns_name
-                        )
+                    self.site_addr_oath = ssm.StringParameter(
+                        scope=self,
+                        id="site-addr-oath",
+                        parameter_name="site_addr_oath",
+                        string_value='https://' + self.accelerator.dns_name
+                    )
                 else:
-                    if self.node.try_get_context("certificate_arn") or self.node.try_get_context("route53_domain"):
-                        self.site_addr_oath = ssm.StringParameter(
-                            scope=self,
-                            id="site-addr-oath",
-                            parameter_name="site_addr_oath",
-                            string_value='https://' + self.alb.load_balancer_dns_name
-                        )
-                    else:
-                        self.site_addr_oath = ssm.StringParameter(
-                            scope=self,
-                            id="site-addr-oath",
-                            parameter_name="site_addr_oath",
-                            string_value='http://' + self.alb.load_balancer_dns_name
-                        )
+                    self.site_addr_oath = ssm.StringParameter(
+                        scope=self,
+                        id="site-addr-oath",
+                        parameter_name="site_addr_oath",
+                        string_value='https://' + self.alb.load_balancer_dns_name
+                    )
+
+    def _tls_enabled(self):
+        """True when the public ALB should terminate HTTPS.
+
+        HTTPS is used when any of the following is set:
+        - a user-supplied ACM certificate_arn context value,
+        - a route53_domain context value (drives a DNS-validated ACM cert), or
+        - a self-signed certificate ARN passed into this stack (no-domain HTTPS).
+        """
+        return bool(
+            self.node.try_get_context("certificate_arn")
+            or self.node.try_get_context("route53_domain")
+            or self.self_signed_certificate_arn
+        )
 
     def _create_and_configure_dns_and_certificates(self):
         """Set up Route 53 records and ACM certificates when domain context is supplied."""
+
+        # Self-signed (no-domain) HTTPS: resolve the imported ACM cert into
+        # self.certificate so the ALB listener can reference it. Route 53 records
+        # and DNS-validated certs are only created on the domain path below.
+        if self.self_signed_certificate_arn and not self.node.try_get_context("route53_domain"):
+            self.certificate = acm.Certificate.from_certificate_arn(
+                self, "SelfSignedDomainCert", self.self_signed_certificate_arn
+            )
 
         if self.node.try_get_context("route53_domain"):
 
@@ -1452,7 +1429,9 @@ class OpenemrEcsStack(Stack):
     def _create_openemr_service(self):
         """Create the OpenEMR task definition, service, and integrations with supporting services."""
 
-        # Test for user supplied certificate
+        # Test for user supplied certificate (takes precedence). The self-signed
+        # certificate (if any) was already resolved into self.certificate in
+        # _create_and_configure_dns_and_certificates.
         if self.node.try_get_context("certificate_arn"):
             self.certificate = acm.Certificate.from_certificate_arn(
                 self,
@@ -1481,27 +1460,344 @@ class OpenemrEcsStack(Stack):
             efs_volume_configuration=self.efs_volume_configuration_for_ssl_folder
         )
 
-        # This script sets up certificates and runs OpenEMR setup.
-        # IMPORTANT: The Redis TLS fix must run AFTER openemr.sh because openemr.sh
-        # hardcodes REDIS_PATH="tcp://${REDIS_SERVER}:6379" and overwrites any earlier config.
-        # Solution: Run openemr.sh in background, wait for Redis config to be created, then fix it.
-        # PHP max_execution_time increased to 300s for slow FHIR API queries (MedicationRequest, Immunization)
-        command_array = [
-            'CA_CERT=$([ -f /swarm-pieces/ssl/certs/ca-certificates.crt ] && echo /swarm-pieces/ssl/certs/ca-certificates.crt || echo /etc/ssl/certs/ca-certificates.crt) && \
-            OPENEMR_SH=$([ -f /var/www/localhost/htdocs/openemr/openemr.sh ] && echo /var/www/localhost/htdocs/openemr/openemr.sh || ([ -f /var/www/localhost/htdocs/openemr.sh ] && echo /var/www/localhost/htdocs/openemr.sh || echo /var/www/html/openemr.sh)) && \
-            curl --cacert $CA_CERT -o /root/certs/redis/redis-ca \
-            --create-dirs https://www.amazontrust.com/repository/AmazonRootCA1.pem && \
-            chown apache /root/certs/redis/redis-ca && \
-            curl --cacert $CA_CERT -o /root/certs/mysql/server/mysql-ca \
-            --create-dirs https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem && \
-            chown apache /root/certs/mysql/server/mysql-ca && \
-            chmod +x $OPENEMR_SH && \
-            echo "1 23  *   *   *   httpd -k graceful" >> /etc/crontabs/root && \
-            sed -i "s|tcp://\\${REDIS_SERVER}|tls://\\${REDIS_SERVER}|g" $OPENEMR_SH && \
-            sed -i "s/max_execution_time = 60/max_execution_time = 300/g" /etc/php*/php.ini && \
-            sed -i "s/max_input_time = 60/max_input_time = 300/g" /etc/php*/php.ini && \
-            $OPENEMR_SH'
+        # Container startup command that sets up SSL/TLS certificates and performs a
+        # reliable OpenEMR first-boot. This is a faithful port of the proven, complete
+        # startup script from the sibling ambient-listening demo, which deploys OpenEMR
+        # reliably every time. It replaces the previous piecemeal &&-chained command.
+        #
+        # Why the whole script (not fragments): OpenEMR first-boot on Aurora with
+        # require_secure_transport=ON fails intermittently when only individual fixes
+        # are ported. The cohesive script below handles, in order: working-dir/apache-user
+        # verification, EFS sites skeleton restore from /swarm-pieces/sites, cert dir
+        # creation, Redis + RDS CA download with validation, RDS CA deployment where
+        # OpenEMR auto-detects it (sites/default/documents/certificates/mysql-ca),
+        # system trust-store update, stale php-file-cache cleanup, the --skip-ssl
+        # devtools patch (so OpenEMR speaks TLS to Aurora), EFS mount write-verification,
+        # a DB-readiness loop (mysqladmin ping WITH SSL, nc fallback), stale docker-leader
+        # cleanup (prevents "Table already exists" after a failed leader), and finally
+        # exec ./openemr.sh.
+        #
+        # HDA-specific behaviors preserved from the previous command:
+        #   - Redis TLS sed on openemr.sh (tcp://${REDIS_SERVER} -> tls://${REDIS_SERVER})
+        #   - php.ini max_execution_time / max_input_time bumped to 300 (slow FHIR queries)
+        #   - HDA DB env var names: MYSQL_HOST, MYSQL_PORT, MYSQL_ROOT_USER, MYSQL_ROOT_PASS
+        #
+        # The commands run sequentially and must all succeed (set -e). They are joined
+        # by newlines (NOT &&-chained) so multi-line shell constructs are preserved.
+        startup_commands = [
+            # Enable immediate exit on any command failure for robust error handling
+            "set -e",
+            # Enable verbose output for better debugging
+            "set -x",
+            # --- Logging Setup ---
+            'log() { echo "[$(date +%Y-%m-%d\\ %H:%M:%S)] $*"; }',
+            'log "=== OpenEMR Container Startup Script ==="',
+            'log "Starting container initialization..."',
+            # --- Working Directory Verification ---
+            'cd /var/www/localhost/htdocs/openemr || { log "ERROR: Failed to change to OpenEMR directory"; exit 1; }',
+            'if [ "$PWD" != "/var/www/localhost/htdocs/openemr" ]; then',
+            '  log "ERROR: Working directory verification failed. Expected /var/www/localhost/htdocs/openemr, got $PWD"',
+            "  exit 1",
+            "fi",
+            'log "Working directory verified: $PWD"',
+            # --- Apache User Verification ---
+            "if ! id apache >/dev/null 2>&1; then",
+            '  log "ERROR: Apache user does not exist in container image"',
+            "  exit 1",
+            "fi",
+            'log "Apache user verified"',
+            # --- Persistence & EFS Initialization ---
+            # If the shared EFS sites/default directory is missing or uninitialized,
+            # restore the pristine skeleton from the container image.
+            'log "Checking EFS sites directory initialization..."',
+            "if [ ! -d /var/www/localhost/htdocs/openemr/sites/default ] || [ ! -f /var/www/localhost/htdocs/openemr/sites/default/sqlconf.php ]; then",
+            '  log "EFS sites directory missing or uninitialized, restoring from image..."',
+            "  if [ ! -d /swarm-pieces/sites ]; then",
+            '    log "ERROR: Source directory /swarm-pieces/sites not found in container image"',
+            "    exit 1",
+            "  fi",
+            "  rsync --owner --group --perms --recursive --links --verbose /swarm-pieces/sites /var/www/localhost/htdocs/openemr/ || {",
+            '    log "ERROR: Failed to restore site skeleton from image"',
+            "    exit 1",
+            "  }",
+            '  log "Site skeleton restored successfully"',
+            "else",
+            '  log "EFS sites directory already initialized"',
+            "fi",
+            # --- Directory Setup ---
+            'log "Creating certificate directories..."',
+            "mkdir -p /var/www/localhost/htdocs/openemr/sites/default/documents/certificates /root/certs/redis /root/certs/mysql/server || {",
+            '  log "ERROR: Failed to create certificate directories"',
+            "  exit 1",
+            "}",
+            "for dir in /var/www/localhost/htdocs/openemr/sites/default/documents/certificates /root/certs/redis /root/certs/mysql/server; do",
+            '  if [ ! -d "$dir" ]; then',
+            '    log "ERROR: Directory $dir was not created"',
+            "    exit 1",
+            "  fi",
+            "done",
+            'log "Certificate directories created and verified"',
+            # --- Redis/Valkey TLS Support ---
+            # Download the Amazon Root CA required for ElastiCache/Valkey TLS connections
+            'log "Downloading Amazon Root CA1 for Redis/Valkey TLS..."',
+            'REDIS_CA_URL="https://www.amazontrust.com/repository/AmazonRootCA1.pem"',
+            'REDIS_CA_PATH="/root/certs/redis/redis-ca"',
+            'if [ ! -f "$REDIS_CA_PATH" ] || [ ! -s "$REDIS_CA_PATH" ]; then',
+            '  curl -f --max-time 30 --connect-timeout 10 --retry 3 --retry-delay 2 --retry-connrefused --cacert /swarm-pieces/ssl/certs/ca-certificates.crt -o "$REDIS_CA_PATH" "$REDIS_CA_URL" || {',
+            '    log "ERROR: Failed to download Redis CA certificate from $REDIS_CA_URL"',
+            "    exit 1",
+            "  }",
+            '  if [ ! -f "$REDIS_CA_PATH" ] || [ ! -s "$REDIS_CA_PATH" ]; then',
+            '    log "ERROR: Redis CA certificate file is missing or empty after download"',
+            "    exit 1",
+            "  fi",
+            '  CERT_SIZE=$(wc -c < "$REDIS_CA_PATH")',
+            '  if [ "$CERT_SIZE" -lt 500 ] || [ "$CERT_SIZE" -gt 10000 ]; then',
+            '    log "ERROR: Redis CA certificate size ($CERT_SIZE bytes) is outside expected range (500-10000 bytes)"',
+            "    exit 1",
+            "  fi",
+            '  if ! head -n 1 "$REDIS_CA_PATH" | grep -q "BEGIN CERTIFICATE" 2>/dev/null; then',
+            '    log "ERROR: Redis CA certificate does not appear to be valid PEM format"',
+            "    exit 1",
+            "  fi",
+            '  log "Redis CA certificate downloaded successfully ($CERT_SIZE bytes) and validated"',
+            "else",
+            '  log "Redis CA certificate already exists, skipping download"',
+            "fi",
+            'chown apache "$REDIS_CA_PATH" || { log "ERROR: Failed to set ownership on Redis CA certificate"; exit 1; }',
+            'log "Redis CA certificate ready"',
+            # --- MySQL/RDS SSL Support ---
+            # Download the RDS CA bundle required for Aurora MySQL SSL connections
+            'log "Downloading RDS CA bundle for MySQL SSL..."',
+            'MYSQL_CA_URL="https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"',
+            'MYSQL_CA_PATH="/root/certs/mysql/server/mysql-ca"',
+            'if [ ! -f "$MYSQL_CA_PATH" ] || [ ! -s "$MYSQL_CA_PATH" ]; then',
+            '  curl -f --max-time 30 --connect-timeout 10 --retry 3 --retry-delay 2 --retry-connrefused --cacert /swarm-pieces/ssl/certs/ca-certificates.crt -o "$MYSQL_CA_PATH" "$MYSQL_CA_URL" || {',
+            '    log "ERROR: Failed to download MySQL CA certificate from $MYSQL_CA_URL"',
+            "    exit 1",
+            "  }",
+            '  if [ ! -f "$MYSQL_CA_PATH" ] || [ ! -s "$MYSQL_CA_PATH" ]; then',
+            '    log "ERROR: MySQL CA certificate file is missing or empty after download"',
+            "    exit 1",
+            "  fi",
+            '  CERT_SIZE=$(wc -c < "$MYSQL_CA_PATH")',
+            '  if [ "$CERT_SIZE" -lt 10000 ] || [ "$CERT_SIZE" -gt 1000000 ]; then',
+            '    log "ERROR: MySQL CA certificate bundle size ($CERT_SIZE bytes) is outside expected range (10000-1000000 bytes)"',
+            "    exit 1",
+            "  fi",
+            '  if ! head -n 1 "$MYSQL_CA_PATH" | grep -q "BEGIN CERTIFICATE" 2>/dev/null; then',
+            '    log "ERROR: MySQL CA certificate bundle does not appear to be valid PEM format"',
+            "    exit 1",
+            "  fi",
+            '  log "MySQL CA certificate bundle downloaded successfully ($CERT_SIZE bytes) and validated"',
+            "else",
+            '  log "MySQL CA certificate already exists, skipping download"',
+            "fi",
+            'chown apache "$MYSQL_CA_PATH" || { log "ERROR: Failed to set ownership on MySQL CA certificate"; exit 1; }',
+            # --- Certificate Deployment ---
+            # Place the MySQL CA where OpenEMR's logic automatically detects and uses it.
+            # Without this, Aurora rejects the connection with
+            # "Connections using insecure transport are prohibited" (require_secure_transport=ON).
+            'log "Deploying MySQL CA certificate to OpenEMR certificates directory..."',
+            'OPENEMR_CA_PATH="/var/www/localhost/htdocs/openemr/sites/default/documents/certificates/mysql-ca"',
+            'cp "$MYSQL_CA_PATH" "$OPENEMR_CA_PATH" || {',
+            '  log "ERROR: Failed to copy MySQL CA certificate to OpenEMR directory"',
+            "  exit 1",
+            "}",
+            'chown apache "$OPENEMR_CA_PATH" || { log "ERROR: Failed to set ownership on OpenEMR MySQL CA certificate"; exit 1; }',
+            'chmod 744 "$OPENEMR_CA_PATH" || { log "ERROR: Failed to set permissions on OpenEMR MySQL CA certificate"; exit 1; }',
+            'if [ ! -f "$OPENEMR_CA_PATH" ] || [ ! -r "$OPENEMR_CA_PATH" ]; then',
+            '  log "ERROR: OpenEMR MySQL CA certificate is missing or not readable after deployment"',
+            "  exit 1",
+            "fi",
+            'log "MySQL CA certificate deployed successfully"',
+            # --- OpenEMR Bootstrap Reliability (RDS TLS + idempotent retries) ---
+            # OpenEMR's devtools library hard-codes `mariadb --skip-ssl` for setting globals.
+            # With Aurora's require_secure_transport=ON, that causes repeated failures AFTER a
+            # partial install, leading to "Table already exists" on the next attempt. We patch
+            # the library at container startup to remove `--skip-ssl` so the client negotiates TLS.
+            'log "Applying OpenEMR bootstrap reliability fixes (RDS TLS + retry safety)..."',
+            # Ensure OpenEMR's opcache file cache doesn't fail on retries
+            'if [ -d "/tmp/php-file-cache" ]; then',
+            '  log "Removing stale /tmp/php-file-cache from prior attempt"',
+            '  rm -rf "/tmp/php-file-cache" 2>/dev/null || true',
+            "fi",
+            # Ensure the RDS CA bundle is in the system trust store (helps CLI + PHP DB connections)
+            "if command -v update-ca-certificates >/dev/null 2>&1; then",
+            '  RDS_CA_DST="/usr/local/share/ca-certificates/rds-global-bundle.crt"',
+            '  (cp "$MYSQL_CA_PATH" "$RDS_CA_DST" 2>/dev/null || cp "$OPENEMR_CA_PATH" "$RDS_CA_DST" 2>/dev/null || true)',
+            '  update-ca-certificates >/dev/null 2>&1 || log "WARNING: update-ca-certificates failed; relying on app-provided CA paths"',
+            "else",
+            '  log "WARNING: update-ca-certificates not available; relying on app-provided CA paths"',
+            "fi",
+            # Patch devtools library to remove explicit `--skip-ssl` flags that break RDS secure transport
+            'if [ -f "/root/devtoolsLibrary.source" ]; then',
+            '  if grep -q -- "--skip-ssl" /root/devtoolsLibrary.source 2>/dev/null; then',
+            '    log "Patching /root/devtoolsLibrary.source: removing --skip-ssl to allow TLS to RDS"',
+            "    sed -i 's/ --skip-ssl//g' /root/devtoolsLibrary.source 2>/dev/null || true",
+            "  fi",
+            "fi",
+            # --- Verification ---
+            'log "Verifying critical files and directories..."',
+            'for path in "$REDIS_CA_PATH" "$MYSQL_CA_PATH" "$OPENEMR_CA_PATH" /var/www/localhost/htdocs/openemr/sites/default; do',
+            '  if [ ! -e "$path" ]; then',
+            '    log "ERROR: Critical path missing: $path"',
+            "    exit 1",
+            "  fi",
+            "done",
+            'log "All critical paths verified"',
+            # --- Final Preparation ---
+            'log "Performing final preparation steps..."',
+            # Ensure the primary startup script exists and is executable
+            "if [ ! -f ./openemr.sh ]; then",
+            '  log "ERROR: openemr.sh not found in working directory"',
+            "  exit 1",
+            "fi",
+            'chmod +x ./openemr.sh || { log "ERROR: Failed to make openemr.sh executable"; exit 1; }',
+            'log "openemr.sh is executable"',
+            # --- HDA: Redis TLS fix on openemr.sh ---
+            # HDA uses Valkey/Redis with TLS. openemr.sh hardcodes tcp://${REDIS_SERVER};
+            # rewrite it to tls://${REDIS_SERVER} so the client negotiates TLS to Valkey.
+            'log "Applying Redis TLS fix to openemr.sh (tcp:// -> tls://)..."',
+            'sed -i "s|tcp://${REDIS_SERVER}|tls://${REDIS_SERVER}|g" ./openemr.sh || log "WARNING: Redis TLS sed on openemr.sh failed"',
+            # --- HDA: php.ini tuning for slow FHIR API queries ---
+            'log "Tuning php.ini (max_execution_time / max_input_time -> 300)..."',
+            'sed -i "s/max_execution_time = 60/max_execution_time = 300/g" /etc/php*/php.ini || log "WARNING: php.ini max_execution_time sed failed"',
+            'sed -i "s/max_input_time = 60/max_input_time = 300/g" /etc/php*/php.ini || log "WARNING: php.ini max_input_time sed failed"',
+            # Add a cron job for graceful Apache restarts (idempotent)
+            'if ! grep -q "httpd -k graceful" /etc/crontabs/root 2>/dev/null; then',
+            '  echo "1 23  *   *   *   httpd -k graceful" >> /etc/crontabs/root',
+            '  log "Added Apache graceful restart cron job"',
+            "else",
+            '  log "Apache graceful restart cron job already exists"',
+            "fi",
+            'log "=== Container initialization complete ==="',
+            # --- EFS Mount Verification ---
+            'log "Verifying EFS mount points are writable..."',
+            'EFS_SITES_TEST_FILE="/var/www/localhost/htdocs/openemr/sites/.efs_write_test"',
+            'EFS_SSL_TEST_FILE="/etc/ssl/.efs_write_test"',
+            'if touch "$EFS_SITES_TEST_FILE" 2>/dev/null && rm -f "$EFS_SITES_TEST_FILE" 2>/dev/null; then',
+            '  log "EFS sites mount verified (writable)"',
+            "else",
+            '  log "ERROR: EFS sites mount is not writable. Cannot proceed with setup."',
+            "  exit 1",
+            "fi",
+            'if touch "$EFS_SSL_TEST_FILE" 2>/dev/null && rm -f "$EFS_SSL_TEST_FILE" 2>/dev/null; then',
+            '  log "EFS SSL mount verified (writable)"',
+            "else",
+            '  log "ERROR: EFS SSL mount is not writable. Cannot proceed with setup."',
+            "  exit 1",
+            "fi",
+            'log "All EFS mounts verified and writable"',
+            # --- Database Readiness Check ---
+            # Proactively verify the database is reachable (with SSL) before OpenEMR setup.
+            # Uses HDA's env var names: MYSQL_HOST, MYSQL_PORT, MYSQL_ROOT_USER, MYSQL_ROOT_PASS.
+            'log "Checking database connectivity..."',
+            'if [ -z "$MYSQL_HOST" ] || [ -z "$MYSQL_ROOT_PASS" ]; then',
+            '  log "WARNING: Database credentials not available for readiness check, will rely on OpenEMR retry logic"',
+            "else",
+            "  DB_READY=0",
+            "  MAX_ATTEMPTS=30",
+            "  INITIAL_DELAY=2",
+            "  CURRENT_DELAY=$INITIAL_DELAY",
+            "  for attempt in $(seq 1 $MAX_ATTEMPTS); do",
+            "    if command -v mysqladmin >/dev/null 2>&1; then",
+            '      MYSQLADMIN_CMD="mysqladmin ping -h \\"$MYSQL_HOST\\" -u \\"$MYSQL_ROOT_USER\\" -p\\"$MYSQL_ROOT_PASS\\""',
+            '      if [ -n "$MYSQL_CA_PATH" ] && [ -f "$MYSQL_CA_PATH" ]; then',
+            '        MYSQLADMIN_CMD="$MYSQLADMIN_CMD --ssl --ssl-ca=\\"$MYSQL_CA_PATH\\""',
+            "      else",
+            '        MYSQLADMIN_CMD="$MYSQLADMIN_CMD --ssl"',
+            "      fi",
+            '      if eval "$MYSQLADMIN_CMD" 2>&1; then',
+            '        log "Database connectivity verified (attempt $attempt/$MAX_ATTEMPTS)"',
+            "        DB_READY=1",
+            "        break",
+            "      fi",
+            '    elif command -v nc >/dev/null 2>&1 && [ -n "$MYSQL_PORT" ]; then',
+            '      if nc -z -w 3 "$MYSQL_HOST" "${MYSQL_PORT:-3306}" 2>/dev/null; then',
+            '        log "Database port is reachable (attempt $attempt/$MAX_ATTEMPTS), assuming ready"',
+            "        DB_READY=1",
+            "        break",
+            "      fi",
+            "    else",
+            '      log "WARNING: Neither mysqladmin nor nc available for database readiness check"',
+            "      DB_READY=1",
+            "      break",
+            "    fi",
+            '    if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then',
+            '      log "Database not ready yet, waiting ${CURRENT_DELAY}s before retry (attempt $attempt/$MAX_ATTEMPTS)..."',
+            "      sleep $CURRENT_DELAY",
+            "      CURRENT_DELAY=$((CURRENT_DELAY * 2))",
+            '      if [ "$CURRENT_DELAY" -gt 60 ]; then',
+            "        CURRENT_DELAY=60",
+            "      fi",
+            "    fi",
+            "  done",
+            '  if [ "$DB_READY" -eq 0 ]; then',
+            '    log "WARNING: Database readiness check failed after $MAX_ATTEMPTS attempts"',
+            '    log "Database may still be initializing. OpenEMR will retry setup automatically."',
+            "  fi",
+            "fi",
+            # --- Valkey/Redis Connectivity Check ---
+            'log "Checking Valkey/Redis connectivity..."',
+            'if [ -z "$REDIS_SERVER" ] || [ "$REDIS_SERVER" = "null" ]; then',
+            '  log "Valkey/Redis not configured, skipping connectivity check"',
+            "else",
+            '  REDIS_HOST="${REDIS_SERVER%%:*}"',
+            '  REDIS_PORT="${REDIS_SERVER##*:}"',
+            '  if [ "$REDIS_PORT" = "$REDIS_HOST" ] || [ -z "$REDIS_PORT" ]; then',
+            '    REDIS_PORT="6379"',
+            "  fi",
+            "  if command -v nc >/dev/null 2>&1; then",
+            '    if nc -z -w 3 "$REDIS_HOST" "$REDIS_PORT" 2>/dev/null; then',
+            '      log "Valkey/Redis connectivity verified ($REDIS_HOST:$REDIS_PORT)"',
+            "    else",
+            '      log "WARNING: Valkey/Redis not reachable at $REDIS_HOST:$REDIS_PORT"',
+            '      log "Application may have degraded cache functionality, but will continue startup"',
+            "    fi",
+            "  else",
+            '    log "WARNING: nc (netcat) not available for Valkey/Redis connectivity check"',
+            "  fi",
+            "fi",
+            # --- Stale Leader File Cleanup ---
+            # Clean up stale docker-leader files left by failed containers. A leader that
+            # fails during auto_configure.php leaves a stale docker-leader file and a
+            # partially initialized database; the next leader then fails with
+            # "Table already exists". If docker-completed exists, proceed; if docker-leader
+            # is older than 20 minutes without docker-completed, remove it.
+            'log "Checking for stale docker-leader files..."',
+            'LEADER_FILE="/var/www/localhost/htdocs/openemr/sites/docker-leader"',
+            'COMPLETED_FILE="/var/www/localhost/htdocs/openemr/sites/docker-completed"',
+            'if [ -f "$COMPLETED_FILE" ]; then',
+            '  log "Setup completed successfully (docker-completed file exists), proceeding normally"',
+            'elif [ -f "$LEADER_FILE" ]; then',
+            '  log "docker-leader file exists but docker-completed does not, checking if leader is stale..."',
+            '  LEADER_MTIME=$(stat -c %Y "$LEADER_FILE" 2>/dev/null || stat -f %m "$LEADER_FILE" 2>/dev/null || echo "")',
+            '  if [ -n "$LEADER_MTIME" ] && [ "$LEADER_MTIME" != "0" ]; then',
+            "    CURRENT_TIME=$(date +%s)",
+            "    AGE_SECONDS=$((CURRENT_TIME - LEADER_MTIME))",
+            '    if [ "$AGE_SECONDS" -gt 1200 ]; then',
+            '      log "WARNING: Stale docker-leader file detected (${AGE_SECONDS}s old, >20min). Leader likely failed mid-setup."',
+            "      log \"This can cause 'Table already exists' errors. Cleaning up stale leader file...\"",
+            '      rm -f "$LEADER_FILE" || log "WARNING: Failed to remove stale leader file, continuing anyway"',
+            '      log "Stale leader file cleaned up. Another container can now become leader and handle partial database state."',
+            "    else",
+            '      log "docker-leader file is recent (${AGE_SECONDS}s old), waiting for leader to complete setup..."',
+            "    fi",
+            "  else",
+            '    log "Could not determine age of docker-leader file. Will rely on openemr.sh timeout handling."',
+            "  fi",
+            "else",
+            '  log "No docker-leader file found, this container may become the leader"',
+            "fi",
+            'log "Handing over to openemr.sh..."',
+            # --- Application Launch ---
+            # Hand over control to the main OpenEMR entrypoint script (exec for signal handling)
+            "exec ./openemr.sh",
         ]
+        # Join commands with newlines instead of && to preserve multi-line shell constructs.
+        # set -e at the top ensures the script exits on any unhandled error.
+        command_array = ["\n".join(startup_commands)]
 
         # Define secrets
         secrets = {
@@ -1569,8 +1865,14 @@ class OpenemrEcsStack(Stack):
                                                                           health_check=ecs.HealthCheck(
                                                                               command=["CMD-SHELL",
                                                                                        "curl -f -k https://localhost:443/swagger || exit 1"],
+                                                                              # ECS caps container health-check start_period at 300s
+                                                                              # (the maximum ECS allows). Cold-boot headroom beyond
+                                                                              # this comes from retries (5 x 120s interval) and from the
+                                                                              # service-level health_check_grace_period (1200s), which
+                                                                              # has no such cap.
                                                                               start_period=Duration.seconds(300),
-                                                                              interval=Duration.seconds(120)
+                                                                              interval=Duration.seconds(120),
+                                                                              retries=5
                                                                           ),
                                                                           image=ecs.ContainerImage.from_registry(
                                                                               f"openemr/openemr:{self.openemr_version}"),
@@ -1597,33 +1899,91 @@ class OpenemrEcsStack(Stack):
             efs_mount_point_for_ssl_folder
         )
 
-        # Create proxy service with load balancer
-        if self.node.try_get_context("certificate_arn") or self.node.try_get_context("route53_domain"):
-            openemr_application_load_balanced_fargate_service = ecs_patterns.ApplicationLoadBalancedFargateService(
-                self, "OpenEMRFargateLBService",
-                certificate=self.certificate,
-                min_healthy_percent=100,
-                cluster=self.ecs_cluster,
-                desired_count=self.node.try_get_context("openemr_service_fargate_minimum_capacity"),
-                load_balancer=self.alb,
-                open_listener=False,
-                target_protocol=elb.ApplicationProtocol.HTTPS,
-                task_definition=openemr_fargate_task_definition,
-                health_check_grace_period=Duration.seconds(600)
+        # The public ALB is ALWAYS HTTPS - there is no plain-HTTP listener.
+        # A certificate must be available: a DNS-validated ACM cert (domain path),
+        # a user-supplied certificate_arn, or the imported self-signed cert
+        # (no-domain path, provided by app_full_demo.py). Fail fast if none.
+        if not getattr(self, "certificate", None):
+            raise ValueError(
+                "OpenEMR ALB requires TLS but no certificate is available. "
+                "Provide a route53_domain, a certificate_arn, or pass a "
+                "self_signed_certificate_arn (do not set self_signed_tls=false "
+                "without a domain)."
             )
-        else:
-            openemr_application_load_balanced_fargate_service = ecs_patterns.ApplicationLoadBalancedFargateService(
-                self, "OpenEMRFargateLBService",
-                min_healthy_percent=100,
-                cluster=self.ecs_cluster,
-                desired_count=self.node.try_get_context("openemr_service_fargate_minimum_capacity"),
-                load_balancer=self.alb,
-                open_listener=False,
-                target_protocol=elb.ApplicationProtocol.HTTPS,
-                task_definition=openemr_fargate_task_definition
-            )
+
+        # Create proxy service with load balancer (HTTPS:443 only)
+        openemr_application_load_balanced_fargate_service = ecs_patterns.ApplicationLoadBalancedFargateService(
+            self, "OpenEMRFargateLBService",
+            certificate=self.certificate,
+            min_healthy_percent=100,
+            cluster=self.ecs_cluster,
+            # Initial desired_count is intentionally 1 to serialize OpenEMR's
+            # first boot. OpenEMR runs with SWARM_MODE=yes, which coordinates
+            # multiple containers via EFS leader-election sentinels
+            # (docker-leader / docker-completed). On a brand-new (empty) EFS,
+            # if two tasks launch simultaneously they can both pass the
+            # "not yet initialized" check before either writes the leader
+            # sentinel, so both run auto_configure against the same empty DB
+            # and the follower dies with "Table already exists", leaving a
+            # stale lock that wedges the service. Starting with a single task
+            # lets one leader fully initialize the DB + EFS (writing
+            # docker-completed) first. CloudFormation only marks the service
+            # stable once that one task is healthy (which, because the ALB
+            # health check passes only after setup completes, means init is
+            # done). The autoscaling ScalableTarget below is created after the
+            # service is stable and then scales out to the configured minimum;
+            # those later tasks see docker-completed and join as followers
+            # without re-running setup. Override with -c
+            # openemr_service_fargate_initial_desired_count=N if needed.
+            desired_count=(
+                self.node.try_get_context("openemr_service_fargate_initial_desired_count")
+                or 1
+            ),
+            load_balancer=self.alb,
+            open_listener=False,
+            target_protocol=elb.ApplicationProtocol.HTTPS,
+            task_definition=openemr_fargate_task_definition,
+            health_check_grace_period=Duration.seconds(1200)
+        )
         openemr_application_load_balanced_fargate_service.node.add_dependency(self.one_time_create_ssl_materials_lambda)
         self.openemr_service = openemr_application_load_balanced_fargate_service.service
+
+        # ------------------------------------------------------------------
+        # Internal service discovery via AWS Cloud Map (mirror OrthancStack).
+        #
+        # The sync / provisioning Lambdas run in private subnets and must reach
+        # OpenEMR over a path that stays inside the VPC (no NAT, no public ALB
+        # DNS). Register the Fargate service in a PrivateDnsNamespace so it is
+        # reachable at a stable internal hostname, exactly as OrthancStack does
+        # (an A record for the service in a PrivateDnsNamespace). The public ALB
+        # and its listener are left intact for the dashboard / interactive users.
+        #
+        # Orthanc passes cloud_map_options into a raw ecs.FargateService; OpenEMR
+        # is built by the ApplicationLoadBalancedFargateService L3 pattern, which
+        # does not expose that constructor arg, so Cloud Map is attached to the
+        # already-constructed service via enable_cloud_map(...). The result is the
+        # same DNS shape Orthanc produces.
+        openemr_namespace = servicediscovery.PrivateDnsNamespace(
+            self,
+            "OpenEMRNamespace",
+            name=f"{self._construct_id.lower()}.local",
+            vpc=self.vpc,
+        )
+        self.openemr_service.enable_cloud_map(
+            cloud_map_namespace=openemr_namespace,
+            name="openemr",
+            dns_record_type=servicediscovery.DnsRecordType.A,
+        )
+
+        # Internal URL for in-VPC callers (sync / provisioning Lambdas). HTTPS on
+        # the container port (443). Domain-agnostic by construction: this string
+        # carries no route53_domain, so it is identical in both deploy variants.
+        self.internal_openemr_url = f"https://openemr.{self._construct_id.lower()}.local:443"
+
+        # Expose the auto-created service/task security group (the one that already
+        # carries the EFS/DB/Valkey/SMTP connections.* rules) so other stacks can
+        # add SG-to-SG ingress on 443 to the task ENIs (NOT the ALB SG).
+        self.openemr_service_security_group = self.openemr_service.connections.security_groups[0]
 
         # Add availability zone rebalancing.
         # This will allow us to recover better in the event an avalability zone goes down.
@@ -1744,7 +2104,20 @@ class OpenemrEcsStack(Stack):
             self.openemr_service.connections.allow_from(self.smtp_interface_endpoint, ec2.Port.tcp(587))
             self.openemr_service.connections.allow_to(self.smtp_interface_endpoint, ec2.Port.tcp(587))
 
-        # Add CPU and memory utilization based autoscaling
+        # Add CPU and memory utilization based autoscaling.
+        #
+        # min_capacity is the steady-state HA floor (configured minimum). The
+        # service is created above with an initial desired_count of 1 so a
+        # single leader can initialize OpenEMR cleanly on first boot; this
+        # ScalableTarget then raises the floor to the configured minimum and
+        # scales the service out. Because CloudFormation only treats the ECS
+        # service as created once it is stable (a healthy task behind the ALB,
+        # which for OpenEMR means first-boot setup has completed and written
+        # the docker-completed sentinel on EFS), the scale-out from 1 to the
+        # configured minimum cannot begin until that leader is healthy. The
+        # additional tasks then see docker-completed and join as followers in
+        # SWARM_MODE without re-running auto_configure, so there is no
+        # first-boot race.
         openemr_scalable_target = (
             self.openemr_service.auto_scale_task_count(
                 min_capacity=self.node.try_get_context("openemr_service_fargate_minimum_capacity"),

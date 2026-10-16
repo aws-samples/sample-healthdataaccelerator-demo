@@ -50,6 +50,8 @@ class HealthLakeSyncStack(Stack):
         vpc_id: str = None,
         db_secret_arn: str = None,
         db_security_group_id: str = None,
+        openemr_service_security_group_id: str = None,
+        openemr_admin_secret_arn: str = None,
         run_initial_sync: bool = False,
         **kwargs
     ) -> None:
@@ -73,6 +75,26 @@ class HealthLakeSyncStack(Stack):
                 vpc=vpc,
                 description="Security group for HealthLake sync Lambda",
                 allow_all_outbound=True,
+            )
+
+        # Import the Aurora DB security group once (reused by the daily DB-sync
+        # block and the OAuth provisioner block) to avoid importing the same SG
+        # twice with duplicate logical ids.
+        db_sg = None
+        if vpc and security_group and db_secret_arn and db_security_group_id:
+            db_sg = ec2.SecurityGroup.from_security_group_id(
+                self, "DbSecurityGroup", db_security_group_id, mutable=True
+            )
+
+        # Import the OpenEMR service/task security group (not the ALB SG) so
+        # in-VPC Lambdas can be granted SG-to-SG ingress on 443 to the task ENIs.
+        openemr_service_sg = None
+        if vpc and security_group and openemr_service_security_group_id:
+            openemr_service_sg = ec2.SecurityGroup.from_security_group_id(
+                self,
+                "OpenEmrServiceSg",
+                openemr_service_security_group_id,
+                mutable=True,
             )
 
         # DynamoDB table for tracking sync state
@@ -141,8 +163,19 @@ class HealthLakeSyncStack(Stack):
                 # Amazon RDS global CA bundle packaged with the Lambda, used
                 # to verify the Aurora/RDS server certificate (TLS).
                 "RDS_CA_BUNDLE": "/var/task/global-bundle.pem",
+                # OpenEMR is reached over the internal Cloud Map hostname and
+                # presents a self-signed CN=localhost cert; disable TLS
+                # verification for this internal in-VPC hop only (the handler
+                # never uses this opt-out for any public/internet call).
+                "OPENEMR_SSL_VERIFY": "false",
             },
         }
+
+        # Clinical-notes-from-DB path in the FHIR sync handler is skipped unless
+        # DB_SECRET_ARN is present. Add it conditionally so a None is never
+        # injected as a literal env value.
+        if db_secret_arn:
+            sync_lambda_kwargs["environment"]["DB_SECRET_ARN"] = db_secret_arn
         
         # Add VPC configuration if VPC is provided
         if vpc and security_group:
@@ -161,6 +194,28 @@ class HealthLakeSyncStack(Stack):
         # Grant Lambda permissions
         sync_state_table.grant_read_write_data(sync_lambda)
         openemr_secret.grant_read(sync_lambda)
+
+        # Allow the FHIR sync Lambda to read the DB secret for the
+        # clinical-notes-from-DB path (resource-scoped, mirrors DbSyncFunction).
+        # The 3306 network path already exists on the shared security_group
+        # (see the daily DB-sync block below), so no extra SG rule is needed.
+        if db_secret_arn:
+            sync_lambda.add_to_role_policy(
+                iam.PolicyStatement(
+                    effect=iam.Effect.ALLOW,
+                    actions=["secretsmanager:GetSecretValue"],
+                    resources=[db_secret_arn],
+                )
+            )
+
+        # SG-to-SG ingress: allow the FHIR sync Lambda (shared security_group)
+        # to reach the OpenEMR task/service on 443 over the Cloud Map path.
+        if openemr_service_sg is not None:
+            openemr_service_sg.add_ingress_rule(
+                security_group,
+                ec2.Port.tcp(443),
+                "FHIR sync Lambda to OpenEMR task on 443",
+            )
 
         # HealthLake permissions
         sync_lambda.add_to_role_policy(
@@ -212,12 +267,9 @@ class HealthLakeSyncStack(Stack):
         # Daily DB Sync Lambda (runs at 2 AM, syncs all data directly from DB)
         # =====================================================================
         if db_secret_arn and vpc and security_group:
-            # Import the database security group to allow Lambda access
-            if db_security_group_id:
-                db_sg = ec2.SecurityGroup.from_security_group_id(
-                    self, "DbSecurityGroup", db_security_group_id,
-                    mutable=True
-                )
+            # Use the shared DB security group import (created above) to allow
+            # the Lambdas sharing security_group to reach Aurora MySQL.
+            if db_sg is not None:
                 # Allow Lambda to connect to database
                 security_group.add_egress_rule(
                     db_sg,
@@ -334,6 +386,70 @@ class HealthLakeSyncStack(Stack):
             
             # Store reference for initial sync trigger
             self.db_sync_lambda = db_sync_lambda
+
+        # =====================================================================
+        # OAuth credential provisioner (runs after OpenEMR is API-enabled)
+        # Registers an OAuth client, enables it in the DB, confirms a ROPC user,
+        # and writes real credentials into the sync credentials secret.
+        # =====================================================================
+        if (
+            vpc
+            and security_group
+            and db_secret_arn
+            and openemr_service_security_group_id
+            and openemr_admin_secret_arn
+        ):
+            oauth_provisioner = triggers.TriggerFunction(
+                self,
+                "OpenEmrOAuthProvisioner",
+                function_name="openemr-oauth-provisioner",
+                runtime=lambda_.Runtime.PYTHON_3_12,
+                code=lambda_.Code.from_asset(
+                    "lambda/openemr_oauth_provisioner",
+                    bundling={
+                        "image": lambda_.Runtime.PYTHON_3_12.bundling_image,
+                        "command": [
+                            "bash", "-c",
+                            "pip install -r requirements.txt -t /asset-output && cp -au . /asset-output"
+                        ],
+                    }
+                ),
+                handler="handler.handler",
+                timeout=Duration.minutes(10),
+                memory_size=512,
+                environment={
+                    "OPENEMR_BASE_URL": openemr_base_url,
+                    # Internal self-signed hop only (see sync Lambda env note).
+                    "OPENEMR_SSL_VERIFY": "false",
+                    "OPENEMR_CREDENTIALS_SECRET": openemr_secret.secret_arn,
+                    "DB_SECRET_ARN": db_secret_arn,
+                    "OPENEMR_ADMIN_SECRET_ARN": openemr_admin_secret_arn,
+                    "RDS_CA_BUNDLE": "/var/task/global-bundle.pem",
+                },
+                vpc=vpc,
+                vpc_subnets=ec2.SubnetSelection(
+                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+                ),
+                # Reuse the shared Lambda SG so the existing 3306 egress/ingress
+                # (daily DB-sync block) and the 443 ingress to the OpenEMR task
+                # SG (above) already apply to the provisioner.
+                security_groups=[security_group],
+            )
+
+            # Read the DB secret (enable the OAuth client via SQL) and the admin
+            # secret (ROPC username/password), both resource-scoped.
+            oauth_provisioner.add_to_role_policy(
+                iam.PolicyStatement(
+                    effect=iam.Effect.ALLOW,
+                    actions=["secretsmanager:GetSecretValue"],
+                    resources=[db_secret_arn, openemr_admin_secret_arn],
+                )
+            )
+
+            # Read + write the credentials secret and use its CMK.
+            openemr_secret.grant_read(oauth_provisioner)
+            openemr_secret.grant_write(oauth_provisioner)
+            openemr_secret_key.grant_encrypt_decrypt(oauth_provisioner)
 
         # Output the FHIR sync Lambda name
         CfnOutput(
