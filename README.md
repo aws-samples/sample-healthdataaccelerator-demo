@@ -90,7 +90,9 @@ The project uses a **dual-sync strategy** to keep HealthLake in sync with OpenEM
 
 **How it works:**
 
-1. **FHIR API sync** — Uses OAuth2 to authenticate with OpenEMR's `/apis/default/fhir/` endpoint. Fetches resources that changed since the last cursor (stored in DynamoDB). Processes in batches of 500, paged at 100. Pushes each resource to HealthLake via SigV4-signed PUT.
+1. **FHIR API sync** — Uses OAuth2 to authenticate with OpenEMR's `/apis/default/fhir/` endpoint. Fetches resources that changed since the last cursor (stored in DynamoDB). Processes in batches of 500, paged at 100. Pushes each resource to HealthLake via SigV4-signed PUT. Clinical notes are synced from the `form_clinical_notes` table and written to HealthLake as `DocumentReference` resources (`id` = `note-<form_clinical_notes.id>`).
+
+   OAuth credentials are provisioned automatically at deploy time by the `OpenEmrOAuthProvisioner` custom resource (`lambda/openemr_oauth_provisioner/`): it registers a confidential OAuth client, enables it and the required API globals (`rest_api`, `rest_fhir_api`, `oauth_password_grant`) in the OpenEMR database over a TLS connection, runs a self-test token request, and writes `{client_id, client_secret, username, password}` to the `openemr-healthlake-sync/credentials` secret — so no manual OAuth setup is needed.
 
 2. **DB sync** — Queries `patient_data`, `form_encounter`, `lists`, `immunizations`, etc. directly. Transforms rows into FHIR R4 resources in Python. Pushes to HealthLake. Updates the cursor so the FHIR API sync picks up from the correct timestamp.
 
@@ -261,6 +263,55 @@ This deploys:
 - Patient 360 Dashboard
 - Combined data loader (auto-populates sample data)
 
+### Orchestrated deployment (recommended): `scripts/deploy.sh`
+
+`scripts/deploy.sh` runs the full demo end to end: it generates Synthea
+patient data, deploys all stacks, uploads the FHIR bundles to S3, invokes the
+data loader, and triggers the initial OpenEMR → HealthLake sync. Use this
+instead of a bare `cdk deploy` when you want data loaded automatically.
+
+```bash
+# Self-signed / domain-less variant (default)
+./scripts/deploy.sh
+
+# DNS variant (Route53 domain + DNS-validated ACM certs)
+ROUTE53_DOMAIN=example.com ROUTE53_HOSTED_ZONE_ID=Z0123456789ABC ./scripts/deploy.sh
+```
+
+Tear everything down with the matching variant:
+
+```bash
+# Self-signed / domain-less
+./scripts/destroy.sh
+
+# DNS (pass the SAME context the stacks were deployed with)
+ROUTE53_DOMAIN=example.com ROUTE53_HOSTED_ZONE_ID=Z0123456789ABC ./scripts/destroy.sh
+```
+
+Optional env vars for `deploy.sh`: `PATIENT_COUNT` (default 100),
+`SYNTHEA_SEED` (default 12345), `SYNTHEA_STATE` (default Massachusetts).
+
+> **Important — pass the same variant to deploy and destroy.** Both scripts
+> pass `route53_domain` (and `route53_hosted_zone_id`) through to CDK. If the
+> stacks were deployed with a domain, run the scripts with the same
+> `ROUTE53_DOMAIN`; running the domain-less default against a DNS deployment (or
+> vice versa) makes CDK reconcile toward the wrong variant.
+
+#### TLS variants
+
+The OpenEMR and Orthanc load balancers are **always HTTPS (443) only** — there
+is no plain-HTTP option. The certificate source depends on whether a domain is
+provided:
+
+- **No domain (default):** a self-signed certificate is generated and imported
+  to ACM by `SelfSignedCertStack`. Browsers show a trust warning (expected for a
+  demo/sandbox with synthetic data) — click through. The Patient 360 Dashboard
+  is CloudFront-fronted and uses a trusted certificate, so it has no warning.
+- **With `route53_domain`:** DNS-validated ACM certificates are used and the
+  apps are reachable at `openemr.<domain>`, `orthanc.<domain>`, and
+  `dashboard.<domain>` with no browser warning. `SelfSignedCertStack` is not
+  created in this variant.
+
 ### Orthanc PACS Server
 ```bash
 # Edit app_orthanc.py with your configuration
@@ -403,7 +454,7 @@ This is a workshop/demo environment. For production healthcare deployments:
 
 The Patient 360 dashboard's AI-powered summaries and chat run on Amazon Bedrock and are provided **for informational and documentation support only — they are not medical advice, a diagnosis, or clinical decision support**:
 - **Human-in-the-loop:** a qualified clinician must independently review and verify any AI-generated content before it is used to inform care. The feature does not make autonomous clinical decisions.
-- **Guardrails:** Amazon Bedrock Guardrails are enabled by default (a denied "MedicalAdvice" topic, HIGH content filters for harmful content, and prompt-injection mitigation) as a defense-in-depth control layered over the model's fact-only prompts.
+- **Guardrails:** Amazon Bedrock Guardrails are enabled by default (a denied "MedicalAdvice" topic, HIGH content filters for harmful content, and prompt-injection mitigation) as a defense-in-depth control layered over the model's fact-only prompts. For demos, the guardrail can also be toggled on/off live via an SSM parameter with no redeploy — see [RESPONSIBLE_AI.md](RESPONSIBLE_AI.md) for the commands.
 - The models summarize the patient's own record; output should always be validated against the source clinical data.
 
 See [RESPONSIBLE_AI.md](RESPONSIBLE_AI.md) for the full responsible AI approach, limitations, and disclaimers.

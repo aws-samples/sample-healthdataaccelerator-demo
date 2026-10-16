@@ -14,12 +14,21 @@
 #   - Python virtual environment with dependencies installed
 #
 # Environment Variables (all optional):
-#   PATIENT_COUNT  - Number of patients to generate (default: 100)
-#   SYNTHEA_SEED   - Random seed for reproducibility (default: 12345)
-#   SYNTHEA_STATE  - US state for patient generation (default: Massachusetts)
+#   PATIENT_COUNT           - Number of patients to generate (default: 100)
+#   SYNTHEA_SEED            - Random seed for reproducibility (default: 12345)
+#   SYNTHEA_STATE           - US state for patient generation (default: Massachusetts)
+#   ROUTE53_DOMAIN          - Route53 domain for the DNS variant (DNS-validated
+#                             ACM certs). Leave empty for the domain-less /
+#                             self-signed variant. MUST match the variant the
+#                             stacks were originally deployed with.
+#   ROUTE53_HOSTED_ZONE_ID  - Hosted zone id for ROUTE53_DOMAIN (optional; the
+#                             app can look it up, but passing it is faster).
 #
 # Usage:
+#   # Domain-less / self-signed variant:
 #   ./scripts/deploy.sh
+#   # DNS variant:
+#   ROUTE53_DOMAIN=example.com ROUTE53_HOSTED_ZONE_ID=Z0123... ./scripts/deploy.sh
 #   PATIENT_COUNT=50 SYNTHEA_STATE=California ./scripts/deploy.sh
 # =============================================================================
 
@@ -39,6 +48,29 @@ SYNTHEA_STATE="${SYNTHEA_STATE:-Massachusetts}"
 
 CDK_APP="python app_full_demo.py"
 CDK_STACK_NAME="CombinedDataLoaderStack"
+
+# ---- TLS / DNS variant selection --------------------------------------------
+# deploy.sh must support BOTH deployment variants and must pass the SAME context
+# the stacks were deployed with, otherwise `cdk deploy --all` reconciles the
+# live stacks toward the wrong variant (e.g. a domain-less run tries to delete
+# the in-use ACM certificate export and rolls the stack back).
+#
+#   - DNS variant: set ROUTE53_DOMAIN (and optionally ROUTE53_HOSTED_ZONE_ID) to
+#     use a Route53 domain with DNS-validated ACM certs.
+#   - Domain-less / self-signed variant: leave ROUTE53_DOMAIN empty (the app
+#     provisions a self-signed cert via SelfSignedCertStack).
+#
+# Both are passed as -c context flags on every cdk invocation below.
+ROUTE53_DOMAIN="${ROUTE53_DOMAIN:-}"
+ROUTE53_HOSTED_ZONE_ID="${ROUTE53_HOSTED_ZONE_ID:-}"
+
+CDK_CONTEXT_ARGS=()
+# Always pass route53_domain explicitly (empty string = domain-less variant) so
+# the synthesized template matches the chosen variant deterministically.
+CDK_CONTEXT_ARGS+=(-c "route53_domain=${ROUTE53_DOMAIN}")
+if [[ -n "${ROUTE53_HOSTED_ZONE_ID}" ]]; then
+    CDK_CONTEXT_ARGS+=(-c "route53_hosted_zone_id=${ROUTE53_HOSTED_ZONE_ID}")
+fi
 
 # ---- Helper Functions -------------------------------------------------------
 log() {
@@ -139,7 +171,13 @@ log "Synthea generated ${BUNDLE_COUNT} FHIR bundles ✓"
 log "Deploying CDK stacks (Phase 1 - infrastructure)..."
 
 cd "${PROJECT_DIR}"
+if [[ -n "${ROUTE53_DOMAIN}" ]]; then
+    log "Deploy variant: DNS (route53_domain=${ROUTE53_DOMAIN})"
+else
+    log "Deploy variant: domain-less / self-signed (no route53_domain)"
+fi
 cdk deploy --all --app "${CDK_APP}" --require-approval never \
+    "${CDK_CONTEXT_ARGS[@]}" \
     || fail "CDK deployment failed. Check the CloudFormation console for details."
 
 log "CDK deployment complete ✓"

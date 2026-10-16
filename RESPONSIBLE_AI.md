@@ -47,6 +47,56 @@ via `guardrailIdentifier` / `guardrailVersion`. It provides:
 The guardrail is enabled by default and can be toggled with the
 `enable_bedrock_guardrails` context flag in `cdk.json` (default `"true"`).
 
+### 3a. Live guardrail toggle (demo)
+The `enable_bedrock_guardrails` context flag above is a *deploy-time* switch. In
+addition, when guardrails are enabled at deploy there is a separate *live*
+on/off switch that takes effect in seconds with **no redeploy**. It is backed by
+an SSM Parameter Store string parameter named
+`/hda/<stackname-lowercased>/guardrails_enabled` (for the default deploy this is
+exactly `/hda/patientdashboardstack/guardrails_enabled`). The exact name is also
+emitted as the `GuardrailToggleParameter` CloudFormation output on
+`PatientDashboardStack`. Valid values are `on` or `off`, and the deploy default
+is `on`.
+
+The parameter is only created when guardrails are enabled at deploy time (the
+default). If guardrails were disabled at deploy, there is no toggle and the
+dashboard runs unguarded. The dashboard API Lambda
+(`lambda/healthlake_api/handler.py`) reads this parameter on every request with
+a short in-process cache (a few seconds), so a change takes effect within
+seconds. It **fails safe**: if the parameter cannot be read, it defaults to the
+guardrail being **ON**.
+
+The toggle changes two things together, which is what makes the contrast visible
+in a live demo:
+
+- **ON** — the Bedrock guardrail (denied `MedicalAdvice` topic, HIGH content
+  filters, prompt-injection/prompt-attack filter) is attached to every model
+  invocation, **and** the system prompt is the strict "facts only" prompt (no
+  interpretation, no recommendations). If the guardrail intervenes, the user
+  gets a safe fallback message directing them to a qualified clinician instead
+  of model output.
+- **OFF** — the guardrail is **not** attached, **and** the system prompt
+  switches to a permissive clinical-assistant prompt that will offer
+  interpretation and recommendations. This makes the unguarded behavior obvious.
+
+So asking the dashboard AI the same clinical question (e.g. a treatment
+recommendation) returns a blocked/neutral "cannot provide medical advice"
+response when ON, and an actual recommendation when OFF.
+
+```bash
+# Turn the guardrail OFF (show raw, unguarded model output)
+aws ssm put-parameter --overwrite --name /hda/patientdashboardstack/guardrails_enabled --value off
+
+# Turn it back ON
+aws ssm put-parameter --overwrite --name /hda/patientdashboardstack/guardrails_enabled --value on
+```
+
+If you deployed under a non-default stack name/id, substitute the lowercased
+stack id in the parameter path, or read the `GuardrailToggleParameter`
+CloudFormation output to get the exact name. This toggle is primarily a
+**demonstration** aid to show the guardrail's effect; the safe default is ON,
+and production use should keep it ON.
+
 ### 4. Data protection
 - Access to the dashboard and its API is authenticated via Amazon Cognito.
 - The API Lambda's IAM permissions are least-privilege and scoped

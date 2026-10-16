@@ -36,6 +36,7 @@ from aws_cdk import (
     aws_secretsmanager as secretsmanager,
     aws_kms as kms,
     aws_bedrock as bedrock,
+    aws_ssm as ssm,
     custom_resources as cr,
 )
 from aws_cdk.aws_lambda_python_alpha import PythonFunction
@@ -85,7 +86,12 @@ class PatientDashboardStack(Stack):
         if enable_bedrock_guardrails:
             self.bedrock_guardrail = bedrock.CfnGuardrail(
                 self,
-                "PatientAiGuardrail",
+                # NOTE: the original guardrail (logical id PatientAiGuardrail,
+                # physical id d89ycg3q57wg) was manually deleted in the Bedrock
+                # console on 2026-09-25, leaving a stale CloudFormation record.
+                # The logical id is bumped to force CloudFormation to create a
+                # fresh guardrail on the next deploy.
+                "PatientAiGuardrailV2",
                 name=f"{construct_id.lower()}-patient-ai-guardrail",
                 description=(
                     "Responsible-AI guardrail for the Patient 360 dashboard "
@@ -143,9 +149,43 @@ class PatientDashboardStack(Stack):
             # An immutable, deployable version of the guardrail.
             self.bedrock_guardrail_version = bedrock.CfnGuardrailVersion(
                 self,
-                "PatientAiGuardrailVersion",
+                # Logical ID bumped to match the recreated guardrail above.
+                "PatientAiGuardrailVersionV2",
                 guardrail_identifier=self.bedrock_guardrail.attr_guardrail_id,
                 description="Initial deployed version",
+            )
+
+        # ------------------------------------------------------------------
+        # Live guardrail on/off toggle (demo control).
+        #
+        # The dashboard's AI summary/chat Lambda invokes the model directly
+        # (bedrock:InvokeModel) and attaches the Responsible-AI guardrail at
+        # inference time. Whether it attaches the guardrail is driven by this
+        # SSM parameter, read on every request. To toggle live during a demo,
+        # change the parameter value - the effect is immediate on the next
+        # request, with no redeploy:
+        #
+        #   # turn the guardrail OFF (show raw, unguarded model output)
+        #   aws ssm put-parameter --overwrite \
+        #     --name /hda/<stack>/guardrails_enabled --value off
+        #   # turn it back ON
+        #   aws ssm put-parameter --overwrite \
+        #     --name /hda/<stack>/guardrails_enabled --value on
+        #
+        # (The exact parameter name is emitted as the GuardrailToggleParameter
+        # stack output.) Only created when guardrails are enabled at deploy.
+        self.guardrail_toggle_param = None
+        if self.bedrock_guardrail:
+            self.guardrail_toggle_param = ssm.StringParameter(
+                self,
+                "GuardrailToggleParam",
+                parameter_name=f"/hda/{construct_id.lower()}/guardrails_enabled",
+                string_value="on",
+                description=(
+                    "Live on/off switch for the Patient 360 AI guardrail. "
+                    "'on' applies the guardrail to summary/chat; any other "
+                    "value disables it. Change to toggle live (no redeploy)."
+                ),
             )
 
         # Create security group for Lambda if VPC provided
@@ -208,7 +248,9 @@ class PatientDashboardStack(Stack):
                     if orthanc_credentials_secret else ""
                 ),
                 # Bedrock Guardrail applied to the AI summary/chat features.
-                # Empty when guardrails are disabled (handler skips them).
+                # Empty when guardrails are disabled at deploy. Whether the
+                # guardrail is actually applied per-request is gated by the SSM
+                # toggle below (read live by the handler).
                 "BEDROCK_GUARDRAIL_ID": (
                     self.bedrock_guardrail.attr_guardrail_id
                     if self.bedrock_guardrail else ""
@@ -216,6 +258,13 @@ class PatientDashboardStack(Stack):
                 "BEDROCK_GUARDRAIL_VERSION": (
                     self.bedrock_guardrail_version.attr_version
                     if self.bedrock_guardrail_version else ""
+                ),
+                # Name of the SSM parameter the handler reads on every request
+                # to decide whether to attach the guardrail (live demo toggle).
+                # Empty when guardrails are disabled at deploy.
+                "GUARDRAIL_TOGGLE_PARAM": (
+                    self.guardrail_toggle_param.parameter_name
+                    if self.guardrail_toggle_param else ""
                 ),
             },
         }
@@ -277,7 +326,8 @@ class PatientDashboardStack(Stack):
             )
         )
 
-        # Grant Bedrock access for AI summaries and chat (Amazon Nova)
+        # Grant Bedrock access for AI summaries and chat (Amazon Nova) via a
+        # direct model invocation.
         api_lambda.add_to_role_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
@@ -300,6 +350,10 @@ class PatientDashboardStack(Stack):
                     resources=[self.bedrock_guardrail.attr_guardrail_arn],
                 )
             )
+
+        # Grant read access to the live guardrail on/off toggle parameter.
+        if self.guardrail_toggle_param:
+            self.guardrail_toggle_param.grant_read(api_lambda)
 
         # Cognito Authorizer for API Gateway
         cognito_authorizer = apigw.CognitoUserPoolsAuthorizer(
@@ -702,6 +756,19 @@ def handler(event, context):
             value=dashboard_admin_secret.secret_arn,
             description="Secrets Manager ARN for dashboard admin credentials",
         )
+
+        if self.guardrail_toggle_param:
+            CfnOutput(
+                self,
+                "GuardrailToggleParameter",
+                value=self.guardrail_toggle_param.parameter_name,
+                description=(
+                    "SSM parameter to toggle the AI guardrail live. Set to "
+                    "'off' to disable, 'on' to enable (effect is immediate on "
+                    "the next request). e.g. aws ssm put-parameter --overwrite "
+                    "--name <this> --value off"
+                ),
+            )
         
         if lambda_security_group:
             CfnOutput(

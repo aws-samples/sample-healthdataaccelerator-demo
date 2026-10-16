@@ -107,23 +107,14 @@ class OrthancStack(Stack):
             allow_all_outbound=True,
         )
         
-        # Add ingress rules for ALB from allowed IP ranges
+        # Add ingress rules for ALB from allowed IP ranges.
+        # HTTPS only - port 443 only, no port 80 (the ALB has no HTTP listener).
         for cidr in allowed_ip_ranges:
-            # Only add HTTP (port 80) if no certificate (dev/testing only)
-            # When certificate is provided, HTTPS only - no port 80 in security group
-            if not certificate_arn:
-                alb_sg.add_ingress_rule(
-                    ec2.Peer.ipv4(cidr),
-                    ec2.Port.tcp(80),
-                    f"HTTP from {cidr}"
-                )
-            else:
-                # HTTPS only - port 443 only, no port 80
-                alb_sg.add_ingress_rule(
-                    ec2.Peer.ipv4(cidr),
-                    ec2.Port.tcp(443),
-                    f"HTTPS from {cidr}"
-                )
+            alb_sg.add_ingress_rule(
+                ec2.Peer.ipv4(cidr),
+                ec2.Port.tcp(443),
+                f"HTTPS from {cidr}"
+            )
 
         # ECS Task Security Group - allows traffic from ALB only
         ecs_sg = ec2.SecurityGroup(
@@ -308,33 +299,30 @@ class OrthancStack(Stack):
             ),
         )
 
-        # Add HTTPS listener if certificate provided
-        if certificate_arn:
-            certificate = acm.Certificate.from_certificate_arn(
-                self, "Certificate", certificate_arn
+        # The Orthanc ALB is ALWAYS HTTPS - there is no plain-HTTP listener.
+        # A certificate_arn must be supplied: either a DNS-validated ACM cert
+        # (domain path) or the imported self-signed cert (no-domain path,
+        # provided by app_full_demo.py). Fail fast if none.
+        if not certificate_arn:
+            raise ValueError(
+                "OrthancStack requires certificate_arn (HTTPS only). Provide a "
+                "route53_domain-derived cert or a self-signed certificate ARN."
             )
-            
-            # HTTPS listener only - no HTTP listener since port 80 is blocked
-            # Note: open=False prevents CDK from adding 0.0.0.0/0 rule
-            alb.add_listener(
-                "HttpsListener",
-                port=443,
-                open=False,
-                certificates=[certificate],
-                default_target_groups=[web_target_group],
-            )
-            
-            web_url = f"https://{alb.load_balancer_dns_name}"
-        else:
-            # HTTP only listener (for development/testing)
-            # Note: open=False prevents CDK from adding 0.0.0.0/0 rule
-            alb.add_listener(
-                "HttpListener",
-                port=80,
-                open=False,
-                default_target_groups=[web_target_group],
-            )
-            web_url = f"http://{alb.load_balancer_dns_name}"
+        certificate = acm.Certificate.from_certificate_arn(
+            self, "Certificate", certificate_arn
+        )
+
+        # HTTPS listener only - port 80 is not exposed.
+        # Note: open=False prevents CDK from adding 0.0.0.0/0 rule
+        alb.add_listener(
+            "HttpsListener",
+            port=443,
+            open=False,
+            certificates=[certificate],
+            default_target_groups=[web_target_group],
+        )
+
+        web_url = f"https://{alb.load_balancer_dns_name}"
 
         # Create Route53 record if domain provided
         if domain_name and hosted_zone_id:
@@ -358,11 +346,8 @@ class OrthancStack(Stack):
                 ),
             )
             
-            # Use custom domain in URL
-            if certificate_arn:
-                web_url = f"https://{domain_name}"
-            else:
-                web_url = f"http://{domain_name}"
+            # Use custom domain in URL (always HTTPS)
+            web_url = f"https://{domain_name}"
 
         # Fargate Service with Cloud Map for internal service discovery
         namespace = servicediscovery.PrivateDnsNamespace(

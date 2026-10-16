@@ -20,8 +20,32 @@ HEALTHLAKE_DATASTORE_ID = os.environ.get('HEALTHLAKE_DATASTORE_ID')
 SYNC_STATE_TABLE = os.environ.get('SYNC_STATE_TABLE', 'openemr-healthlake-sync-state')
 OPENEMR_CREDENTIALS_SECRET = os.environ.get('OPENEMR_CREDENTIALS_SECRET')
 
-# SSL verification for internal OpenEMR connections (self-signed certs in VPC)
-OPENEMR_SSL_VERIFY = os.environ.get('OPENEMR_SSL_CERT', os.environ.get('SSL_CERT_FILE', True))
+# SSL verification for OpenEMR connections.
+#
+# Resolution order (first match wins): OPENEMR_SSL_VERIFY, then OPENEMR_SSL_CERT,
+# then SSL_CERT_FILE (the latter two kept for backward compatibility). The value
+# is interpreted as:
+#   - a false-y string ({'false','0','no','off'}, trimmed/lowercased) -> verify=False
+#   - an existing filesystem path                                     -> use as CA bundle
+#   - anything else                                                   -> verify=True
+_ssl_env = os.environ.get(
+    'OPENEMR_SSL_VERIFY',
+    os.environ.get('OPENEMR_SSL_CERT', os.environ.get('SSL_CERT_FILE', 'true')),
+)
+if isinstance(_ssl_env, str) and _ssl_env.strip().lower() in {'false', '0', 'no', 'off'}:
+    # INTERNAL IN-VPC HOP ONLY. OpenEMR presents a self-signed CN=localhost
+    # certificate on its container port, reached here via a Cloud Map private
+    # DNS name. This traffic never leaves the VPC and this opt-out is NEVER
+    # used for any public/internet call. The public/domain path keeps verify=True.
+    OPENEMR_SSL_VERIFY = False
+elif isinstance(_ssl_env, str) and os.path.exists(_ssl_env):
+    OPENEMR_SSL_VERIFY = _ssl_env  # CA bundle path
+else:
+    OPENEMR_SSL_VERIFY = True
+# Record the resolved TLS posture (never a secret) so a wrong value is visible
+# in CloudWatch instead of silently re-breaking the internal self-signed hop.
+print(f"OpenEMR SSL verify resolved to: {OPENEMR_SSL_VERIFY!r} "
+      f"(source OPENEMR_SSL_VERIFY={_ssl_env!r})")
 
 # Batch settings
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '500'))  # Records per invocation
@@ -566,6 +590,9 @@ def handler(event, context):
     try:
         token = get_openemr_token()
     except Exception as e:
+        # Surface the token-acquisition failure (no secret values) so it is
+        # visible in CloudWatch instead of failing silently.
+        print(f"OpenEMR token error: {e}")
         return {'statusCode': 500, 'error': str(e)}
     
     results = {'synced': 0, 'failed': 0, 'by_type': {}, 'has_more': False}

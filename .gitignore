@@ -164,3 +164,12 @@ scripts/synthea/load_synthea_to_openemr.py
 !scripts/destroy.sh
 !scripts/synthea/synthea.properties
 !scripts/synthea/run_synthea.sh
+
+# Internal agent working notes (contain account-specific details)
+.agents/
+
+# Temporary personal deploy launcher (hardcoded account)
+scripts/_run_deploy.sh
+
+# Generated cdk-nag report artifact
+cdk-nag-report-consolidated.csv

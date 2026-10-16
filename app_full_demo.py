@@ -38,6 +38,7 @@ from infrastructure.healthlake_sync_stack import HealthLakeSyncStack
 from infrastructure.healthlake_datastore_stack import HealthLakeDatastoreStack
 from infrastructure.patient_dashboard_stack import PatientDashboardStack
 from infrastructure.synthea_staging_stack import SyntheaStagingStack
+from infrastructure.self_signed_cert_stack import SelfSignedCertStack
 
 
 class CombinedDataLoaderStack(cdk.Stack):
@@ -217,6 +218,25 @@ env = cdk.Environment(
     region=os.getenv("CDK_DEFAULT_REGION"),
 )
 
+# TLS for the OpenEMR + Orthanc ALBs. These load balancers are ALWAYS HTTPS -
+# there is no plain-HTTP option. When a route53_domain is provided, a
+# DNS-validated ACM certificate is used. Otherwise (no domain), we provision a
+# Lambda-backed custom resource that generates a self-signed certificate and
+# imports it into ACM (public ACM cannot *issue* a cert without domain
+# validation), and its ARN feeds the ALB HTTPS listeners. The self-signed cert
+# is NOT publicly trusted (clients see a trust warning) - intended for demo /
+# sandbox use only (synthetic data). This is automatic on the no-domain path;
+# `-c self_signed_tls=false` can explicitly opt out (only valid alongside a
+# domain, since a domain-less deploy has no other cert source).
+self_signed_cert_arn = None
+if not route53_domain and app.node.try_get_context("self_signed_tls") != "false":
+    self_signed_cert_stack = SelfSignedCertStack(
+        app,
+        "SelfSignedCertStack",
+        env=env,
+    )
+    self_signed_cert_arn = self_signed_cert_stack.certificate_arn
+
 # Deploy Synthea staging bucket first (data is uploaded here before full deploy)
 synthea_staging_stack = SyntheaStagingStack(
     app,
@@ -229,8 +249,11 @@ synthea_staging_stack = SyntheaStagingStack(
 openemr_stack = OpenemrEcsStack(
     app,
     "OpenemrEcsStack",
+    self_signed_certificate_arn=self_signed_cert_arn,
     env=env,
 )
+if self_signed_cert_arn:
+    openemr_stack.add_dependency(self_signed_cert_stack)
 
 # Deploy HealthLake datastore (or use existing one)
 if EXISTING_HEALTHLAKE_DATASTORE_ID and EXISTING_HEALTHLAKE_DATASTORE_ID != "create_new":
@@ -256,10 +279,13 @@ healthlake_kms_key_arn = (
 )
 
 # Deploy Orthanc in the same VPC with HealthLake sync
-# Use the certificate created by OpenEMR stack (wildcard cert for the domain)
+# Use the certificate created by OpenEMR stack (wildcard cert for the domain),
+# or the imported self-signed cert when using -c self_signed_tls=true (no domain).
 orthanc_certificate_arn = None
 if route53_domain and hasattr(openemr_stack, 'certificate'):
     orthanc_certificate_arn = openemr_stack.certificate.certificate_arn
+elif self_signed_cert_arn:
+    orthanc_certificate_arn = self_signed_cert_arn
 
 orthanc_stack = OrthancStack(
     app,
@@ -278,18 +304,25 @@ orthanc_stack = OrthancStack(
 orthanc_stack.add_dependency(openemr_stack)
 if healthlake_datastore_stack:
     orthanc_stack.add_dependency(healthlake_datastore_stack)
+if self_signed_cert_arn:
+    orthanc_stack.add_dependency(self_signed_cert_stack)
 
 # Deploy HealthLake sync for OpenEMR FIRST (creates the sync Lambda)
 # This must deploy before data loader so the Lambda exists when data loader tries to invoke it
 healthlake_sync_stack = HealthLakeSyncStack(
     app,
     "HealthLakeSyncStack",
-    openemr_base_url=f"https://{openemr_stack.alb.load_balancer_dns_name}",
+    # Internal Cloud Map URL (stays in-VPC); domain-agnostic in both variants.
+    openemr_base_url=openemr_stack.internal_openemr_url,
     healthlake_datastore_id=HEALTHLAKE_DATASTORE_ID,
     healthlake_endpoint=f"https://healthlake.us-east-1.amazonaws.com/datastore/{HEALTHLAKE_DATASTORE_ID}/r4/",
     vpc=openemr_stack.vpc,
     db_secret_arn=openemr_stack.db_instance.secret.secret_arn,
     db_security_group_id=openemr_stack.db_sec_group.security_group_id,
+    # OpenEMR task/service SG (not the ALB SG) for SG-to-SG 443 ingress, and the
+    # admin secret for the OAuth provisioner's ROPC credentials.
+    openemr_service_security_group_id=openemr_stack.openemr_service_security_group.security_group_id,
+    openemr_admin_secret_arn=openemr_stack.password.secret_arn,
     run_initial_sync=False,  # Data loader will trigger sync, not the stack itself
     env=env,
 )
@@ -488,6 +521,21 @@ if app.node.try_get_context("cdk_nag") == "true":
         _stacks_to_suppress.append(healthlake_datastore_stack)
     if enable_data_loading:
         _stacks_to_suppress.append(data_loader_stack)
+    if self_signed_cert_arn:
+        # The cert generator uses a CDK Provider framework Lambda (managed
+        # policies + provider wildcard) and an acm:ImportCertificate "*" resource
+        # (ACM import cannot be scoped to a not-yet-created cert).
+        _stacks_to_suppress.append(self_signed_cert_stack)
+        NagSuppressions.add_stack_suppressions(
+            self_signed_cert_stack,
+            [
+                {"id": "AwsSolutions-IAM5",
+                 "reason": "acm:ImportCertificate has no resource-level scoping for a new certificate; delete/describe are scoped to this account/region."},
+                {"id": "HIPAA.Security-LambdaInsideVPC",
+                 "reason": "The cert-generator and CDK provider-framework Lambdas only call the ACM control-plane API and hold no PHI; VPC attachment is unnecessary."},
+            ],
+            apply_to_nested_stacks=True,
+        )
 
     for _stack in _stacks_to_suppress:
         _rules = list(_COMMON) + _per_stack.get(_stack, [])
